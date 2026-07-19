@@ -93,7 +93,11 @@ public final class IslandRouter {
         }
 
         let oracle = oracleProvider(event.cwd)
-        switch oracle.verdict(toolName: call.name, primaryArgument: call.primaryArgument) {
+        switch oracle.verdict(
+            toolName: call.name,
+            primaryArgument: call.primaryArgument,
+            permissionMode: call.permissionMode
+        ) {
         case .defer_:
             store.setStatus(sessionID, "\(call.name): \(call.summary)")
             respond(id: envelope.id, connection: connection, decision: .ask)

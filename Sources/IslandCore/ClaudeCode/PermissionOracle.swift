@@ -9,6 +9,13 @@ import Foundation
 /// `Tool(prefix:*)` prefix rules, and `Tool(literal)` exact rules. Unknown
 /// syntax errs on the side of showing a card (never silently allows).
 public struct PermissionOracle: Sendable {
+    public enum PermissionMode: String, Sendable, Equatable {
+        case `default`
+        case acceptEdits
+        case plan
+        case bypassPermissions
+    }
+
     /// Tools Claude Code never prompts for.
     public static let alwaysSafeTools: Set<String> = [
         "Read", "Glob", "Grep", "LS", "NotebookRead", "TodoRead", "TodoWrite",
@@ -23,6 +30,7 @@ public struct PermissionOracle: Sendable {
     }
 
     private let allowRules: [Rule]
+    private let defaultMode: PermissionMode?
 
     struct Rule: Sendable {
         let tool: String
@@ -35,8 +43,9 @@ public struct PermissionOracle: Sendable {
         }
     }
 
-    public init(allowPatterns: [String]) {
+    public init(allowPatterns: [String], defaultMode: PermissionMode? = nil) {
         allowRules = allowPatterns.compactMap(Self.parse(pattern:))
+        self.defaultMode = defaultMode
     }
 
     /// Load allow rules the way Claude Code layers them: user settings, user
@@ -49,21 +58,39 @@ public struct PermissionOracle: Sendable {
             "\(cwd)/.claude/settings.local.json",
         ]
         var patterns: [String] = []
+        var defaultMode: PermissionMode?
         for path in candidates {
             guard let data = FileManager.default.contents(atPath: path),
                   let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let permissions = object["permissions"] as? [String: Any],
-                  let allow = permissions["allow"] as? [String]
+                  let permissions = object["permissions"] as? [String: Any]
             else { continue }
-            patterns.append(contentsOf: allow)
+            patterns.append(contentsOf: permissions["allow"] as? [String] ?? [])
+            if let rawMode = permissions["defaultMode"] as? String,
+               let mode = PermissionMode(rawValue: rawMode) {
+                defaultMode = mode
+            }
         }
-        return PermissionOracle(allowPatterns: patterns)
+        return PermissionOracle(allowPatterns: patterns, defaultMode: defaultMode)
     }
 
-    public func verdict(toolName: String, primaryArgument: String?) -> Verdict {
+    public func verdict(
+        toolName: String,
+        primaryArgument: String?,
+        permissionMode: PermissionMode? = nil
+    ) -> Verdict {
+        switch permissionMode ?? defaultMode ?? .default {
+        case .bypassPermissions, .plan:
+            return .defer_
+        case .acceptEdits where Self.editTools.contains(toolName):
+            return .defer_
+        case .default, .acceptEdits:
+            break
+        }
         if Self.alwaysSafeTools.contains(toolName) { return .defer_ }
         return matches(toolName: toolName, primaryArgument: primaryArgument) ? .defer_ : .hold
     }
+
+    private static let editTools: Set<String> = ["Edit", "MultiEdit", "Write", "NotebookEdit"]
 
     /// Pure pattern matching, without the safe-tool shortcut. Also used by
     /// ApprovalRulesStore for island-side "always allow" rules.

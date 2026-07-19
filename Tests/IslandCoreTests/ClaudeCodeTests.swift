@@ -1,5 +1,6 @@
 import XCTest
 @testable import IslandCore
+import IslandProtocol
 
 final class PermissionOracleTests: XCTestCase {
     func testSafeToolsAlwaysDefer() {
@@ -35,15 +36,42 @@ final class PermissionOracleTests: XCTestCase {
         let oracle = PermissionOracle(allowPatterns: ["Bash(unclosed", ""])
         XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "ls"), .hold)
     }
+
+    func testBypassAndPlanModesAlwaysDefer() {
+        let oracle = PermissionOracle(allowPatterns: [])
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "rm -rf /", permissionMode: .bypassPermissions), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "mcp__unknown", primaryArgument: nil, permissionMode: .plan), .defer_)
+    }
+
+    func testAcceptEditsDefersEditsButStillHoldsBash() {
+        let oracle = PermissionOracle(allowPatterns: [])
+        for tool in ["Edit", "MultiEdit", "Write", "NotebookEdit"] {
+            XCTAssertEqual(oracle.verdict(toolName: tool, primaryArgument: "/tmp/a", permissionMode: .acceptEdits), .defer_)
+        }
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push", permissionMode: .acceptEdits), .hold)
+    }
+
+    func testSettingsDefaultModeAndPayloadOverride() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("oracle-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        try Data(#"{"permissions":{"defaultMode":"bypassPermissions"}}"#.utf8)
+            .write(to: home.appendingPathComponent(".claude/settings.json"))
+
+        let oracle = PermissionOracle.loadForProject(cwd: home.path, home: home.path)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push"), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push", permissionMode: .default), .hold)
+    }
 }
 
 final class ClaudeCodeInterpreterTests: XCTestCase {
     func testBashToolCall() throws {
-        let payload = Data(#"{"tool_name":"Bash","tool_input":{"command":"npm test"}}"#.utf8)
+        let payload = Data(#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"npm test"}}"#.utf8)
         let call = try XCTUnwrap(ClaudeCodeInterpreter.toolCall(fromPayload: payload))
         XCTAssertEqual(call.name, "Bash")
         XCTAssertEqual(call.primaryArgument, "npm test")
         XCTAssertEqual(call.summary, "npm test")
+        XCTAssertEqual(call.permissionMode, .bypassPermissions)
     }
 
     func testEditToolCall() throws {
@@ -67,6 +95,46 @@ final class ClaudeCodeInterpreterTests: XCTestCase {
             "Done — click to jump"
         )
         XCTAssertNil(ClaudeCodeInterpreter.statusLine(event: "PostToolUse", payload: Data("{}".utf8)))
+    }
+}
+
+final class IslandRouterPermissionModeTests: XCTestCase {
+    @MainActor
+    func testBypassPayloadRespondsAskWithoutRegisteringCard() throws {
+        var descriptors: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        defer { close(descriptors[1]) }
+
+        let queue = DispatchQueue(label: "IslandRouterPermissionModeTests")
+        let connection = SocketConnection(fd: descriptors[0], queue: queue)
+        let gates = GateCenter()
+        let store = SessionStore()
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let router = IslandRouter(store: store, gates: gates, rules: ApprovalRulesStore(path: rulesPath))
+        let payload = Data(#"{"tool_name":"Bash","permission_mode":"bypassPermissions","tool_input":{"command":"rm -rf /tmp/example"}}"#.utf8)
+        let event = HookEvent(
+            agent: "claude-code",
+            event: "PreToolUse",
+            sessionID: "bypass-session",
+            cwd: "/tmp",
+            terminal: TerminalRef(),
+            payload: payload
+        )
+        let line = try WireCodec.encodeLine(Envelope(type: .gateRequest, body: event))
+
+        router.handle(line: Data(line.dropLast()), connection: connection)
+
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(descriptors[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var bytes = [UInt8](repeating: 0, count: 4096)
+        let count = read(descriptors[1], &bytes, bytes.count)
+        XCTAssertGreaterThan(count, 0)
+        let response = try WireCodec.decode(GateResponse.self, from: Data(bytes.prefix(Int(count) - 1)))
+        XCTAssertEqual(response.body.decision, .ask)
+        XCTAssertTrue(gates.pendingIDs.isEmpty)
+        XCTAssertTrue(store.requests.isEmpty)
     }
 }
 

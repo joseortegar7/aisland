@@ -72,6 +72,7 @@ public enum ClaudeCodeInterpreter {
         public let name: String
         public let summary: String
         public let details: RequestDetails
+        public let permissionMode: PermissionOracle.PermissionMode?
         /// The primary string argument permission rules match against
         /// (Bash command, file path, URL).
         public let primaryArgument: String?
@@ -87,6 +88,7 @@ public enum ClaudeCodeInterpreter {
             name: name,
             summary: summary(toolName: name, primary: primary, input: input),
             details: details(toolName: name, input: input),
+            permissionMode: (object["permission_mode"] as? String).flatMap(PermissionOracle.PermissionMode.init(rawValue:)),
             primaryArgument: primary
         )
     }
