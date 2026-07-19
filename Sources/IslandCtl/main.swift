@@ -17,6 +17,8 @@ import IslandProtocol
 //   islandctl demo                      full scripted session
 //   islandctl install-hooks [--settings PATH] [--shim PATH]
 //   islandctl uninstall-hooks [--settings PATH]
+//   islandctl install-copilot-hooks [--home PATH] [--shim PATH]
+//   islandctl uninstall-copilot-hooks [--home PATH]
 //   islandctl version
 
 func argumentValue(_ flag: String, default fallback: String? = nil) -> String? {
@@ -261,6 +263,30 @@ case "uninstall-hooks":
         print("hooks removed from \(settings)")
     } catch {
         FileHandle.standardError.write(Data("islandctl: uninstall failed: \(error)\n".utf8))
+        exit(1)
+    }
+
+case "install-copilot-hooks":
+    guard let shim = argumentValue("--shim") ?? findShim() else {
+        FileHandle.standardError.write(Data("islandctl: pass --shim PATH\n".utf8))
+        exit(66)
+    }
+    let home = argumentValue("--home", default: NSHomeDirectory() + "/.copilot")!
+    do {
+        try CopilotHookInstaller(copilotDirectory: home, shimPath: shim).install()
+        print("Copilot hooks installed into \(home)/hooks/aisland.json")
+    } catch {
+        FileHandle.standardError.write(Data("islandctl: Copilot install failed: \(error)\n".utf8))
+        exit(1)
+    }
+
+case "uninstall-copilot-hooks":
+    let home = argumentValue("--home", default: NSHomeDirectory() + "/.copilot")!
+    do {
+        try CopilotHookInstaller(copilotDirectory: home, shimPath: "unused").uninstall()
+        print("Copilot hooks removed from \(home)")
+    } catch {
+        FileHandle.standardError.write(Data("islandctl: Copilot uninstall failed: \(error)\n".utf8))
         exit(1)
     }
 

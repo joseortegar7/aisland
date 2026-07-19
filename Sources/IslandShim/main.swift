@@ -137,20 +137,7 @@ let response = envelope.body
 guard response.decision == .allow || response.decision == .deny else { exit(0) }
 
 // Format the decision in the agent's native hook-output schema.
-switch agent {
-case "claude-code":
-    let output: [String: Any] = [
-        "hookSpecificOutput": [
-            "hookEventName": "PreToolUse",
-            "permissionDecision": response.decision.rawValue,
-            "permissionDecisionReason": response.reason ?? "Decided from aisland notch",
-        ]
-    ]
-    if let data = try? JSONSerialization.data(withJSONObject: output) {
-        FileHandle.standardOutput.write(data)
-    }
-default:
-    // Unknown agents: no gate output support yet; stay silent (fail-open).
-    break
+if let data = try? NativeGateOutput.encode(agent: agent, event: eventName, response: response) {
+    FileHandle.standardOutput.write(data)
 }
 exit(0)

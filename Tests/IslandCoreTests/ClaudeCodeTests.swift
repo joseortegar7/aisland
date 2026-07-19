@@ -326,12 +326,12 @@ final class CopilotAdapterTests: XCTestCase {
         let hooksDirectory = dir + "/hooks"
         try FileManager.default.createDirectory(atPath: hooksDirectory, withIntermediateDirectories: true)
         try Data("legacy".utf8).write(to: URL(fileURLWithPath: hooksDirectory + "/copyisland.json"))
-        // Seed settings with a foreign hook entry that must survive.
-        let seed = #"{"version":1,"hooks":{"agentStop":[{"type":"command","bash":"/other/tool --event agentStop","timeoutSec":10}]}}"#
+        // Foreign/Vibe hooks survive; legacy aisland entries are removed.
+        let seed = #"{"version":1,"hooks":{"agentStop":[{"type":"command","bash":"/other/tool --event agentStop","timeoutSec":10}],"permissionRequest":[{"type":"command","bash":"/Users/me/.vibe-island/bin/bridge","timeoutSec":10},{"type":"command","bash":"/old/island-shim copilot permissionRequest","timeoutSec":10}]}}"#
         try Data(seed.utf8).write(to: URL(fileURLWithPath: dir + "/settings.json"))
 
         let installer = CopilotHookInstaller(copilotDirectory: dir, shimPath: "/fake/island-shim")
-        XCTAssertEqual(installer.health(), .missing)
+        XCTAssertEqual(installer.health(), .partial)
         try installer.install()
         XCTAssertEqual(installer.health(), .installed)
         let once = try String(contentsOfFile: dir + "/settings.json", encoding: .utf8)
@@ -341,29 +341,33 @@ final class CopilotAdapterTests: XCTestCase {
         XCTAssertTrue(once.contains("/other/tool"), "foreign entries preserved")
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "/hooks/aisland.json"))
 
-        // Hook file has PascalCase events with fail-open guarded commands.
+        // Hook file is the sole aisland registration; only permissionRequest gates.
         let hookData = try XCTUnwrap(FileManager.default.contents(atPath: dir + "/hooks/aisland.json"))
         let hookJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: hookData) as? [String: Any])
         let hooks = try XCTUnwrap(hookJSON["hooks"] as? [String: Any])
-        XCTAssertNotNil(hooks["PreToolUse"])
-        XCTAssertNotNil(hooks["Stop"])
-        XCTAssertNotNil(hooks["SessionEnd"])
-        XCTAssertNotNil(hooks["SubagentStart"])
-        XCTAssertNotNil(hooks["PermissionRequest"])
-        XCTAssertNil(hooks["permissionRequest"])
+        XCTAssertNotNil(hooks["preToolUse"])
+        XCTAssertNotNil(hooks["agentStop"])
+        XCTAssertNotNil(hooks["sessionEnd"])
+        XCTAssertNotNil(hooks["subagentStart"])
+        XCTAssertNotNil(hooks["permissionRequest"])
+        XCTAssertNil(hooks["PermissionRequest"])
         XCTAssertEqual(hookJSON["version"] as? Int, 1)
-        for value in hooks.values {
+        for (event, value) in hooks {
             let entries = value as? [[String: Any]] ?? []
             XCTAssertTrue(entries.allSatisfy { ($0["command"] as? String)?.contains("exit 0") == true })
+            XCTAssertEqual(entries.first?["timeoutSec"] as? Int, event == "permissionRequest" ? 3600 : 10)
+            XCTAssertEqual(
+                (entries.first?["command"] as? String)?.contains("--gate"),
+                event == "permissionRequest"
+            )
         }
         let settingsData = try XCTUnwrap(FileManager.default.contents(atPath: dir + "/settings.json"))
         let settingsJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: settingsData) as? [String: Any])
         let settingsHooks = try XCTUnwrap(settingsJSON["hooks"] as? [String: Any])
         let cliPermissionEntries = try XCTUnwrap(settingsHooks["permissionRequest"] as? [[String: Any]])
-        XCTAssertTrue(cliPermissionEntries.contains {
-            ($0["bash"] as? String)?.contains("exit 0") == true &&
-            ($0["powershell"] as? String)?.contains("exit 0") == true
-        })
+        XCTAssertEqual(cliPermissionEntries.count, 1)
+        XCTAssertTrue((cliPermissionEntries[0]["bash"] as? String)?.contains(".vibe-island") == true)
+        XCTAssertFalse(try String(contentsOfFile: dir + "/settings.json", encoding: .utf8).contains("island-shim"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: hooksDirectory + "/copyisland.json"))
 
         try installer.uninstall()
@@ -371,6 +375,88 @@ final class CopilotAdapterTests: XCTestCase {
         let final = try String(contentsOfFile: dir + "/settings.json", encoding: .utf8)
         XCTAssertTrue(final.contains("/other/tool"), "foreign entries survive uninstall")
         XCTAssertFalse(final.contains("island-shim"))
+    }
+
+    func testPermissionRequestParsing() throws {
+        let sessionID = SessionID(agent: "copilot", raw: "s1")
+        let shell = try XCTUnwrap(CopilotInterpreter.permissionRequest(
+            id: UUID(),
+            sessionID: sessionID,
+            payload: Data(#"{"sessionId":"s1","toolCallId":"call-1","toolName":"bash","toolInput":{"command":"npm test"}}"#.utf8)
+        ))
+        XCTAssertEqual(shell.summary, "npm test")
+        XCTAssertEqual(shell.details, .bash(command: "npm test"))
+        XCTAssertEqual(shell.deduplicationKey, "call-1")
+        XCTAssertFalse(shell.canAlwaysAllow)
+
+        let edit = try XCTUnwrap(CopilotInterpreter.permissionRequest(
+            id: UUID(),
+            sessionID: sessionID,
+            payload: Data(#"{"toolName":"edit","toolInput":"{\"filePath\":\"/tmp/a.swift\",\"oldString\":\"a\",\"newString\":\"b\"}"}"#.utf8)
+        ))
+        XCTAssertEqual(edit.details, .fileEdit(path: "/tmp/a.swift", old: "a", new: "b"))
+
+        let write = try XCTUnwrap(CopilotInterpreter.permissionRequest(
+            id: UUID(),
+            sessionID: sessionID,
+            payload: Data(#"{"tool_name":"create","tool_input":{"path":"/tmp/new.txt","content":"hello"}}"#.utf8)
+        ))
+        XCTAssertEqual(write.details, .fileWrite(path: "/tmp/new.txt", content: "hello"))
+
+        let web = try XCTUnwrap(CopilotInterpreter.permissionRequest(
+            id: UUID(),
+            sessionID: sessionID,
+            payload: Data(#"{"toolName":"web_fetch","toolInput":{"url":"https://example.com"}}"#.utf8)
+        ))
+        XCTAssertEqual(web.summary, "https://example.com")
+    }
+
+    func testNativePermissionResponseSchemas() throws {
+        let allowData = try XCTUnwrap(NativeGateOutput.encode(
+            agent: "copilot",
+            event: "permissionRequest",
+            response: GateResponse(decision: .allow)
+        ))
+        let allow = try XCTUnwrap(JSONSerialization.jsonObject(with: allowData) as? [String: String])
+        XCTAssertEqual(allow, ["behavior": "allow"])
+
+        let denyData = try XCTUnwrap(NativeGateOutput.encode(
+            agent: "copilot",
+            event: "permissionRequest",
+            response: GateResponse(decision: .deny, reason: "No")
+        ))
+        let deny = try XCTUnwrap(JSONSerialization.jsonObject(with: denyData) as? [String: String])
+        XCTAssertEqual(deny, ["behavior": "deny", "message": "No"])
+        XCTAssertNil(try NativeGateOutput.encode(
+            agent: "copilot",
+            event: "permissionRequest",
+            response: GateResponse(decision: .ask)
+        ))
+    }
+
+    func testShimFailsOpenWhenAppUnavailable() throws {
+        let shim = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/debug/island-shim")
+        guard FileManager.default.isExecutableFile(atPath: shim.path) else {
+            throw XCTSkip("island-shim was not built")
+        }
+        let process = Process()
+        process.executableURL = shim
+        process.arguments = ["copilot", "permissionRequest", "--gate"]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "ISLAND_SOCKET": FileManager.default.temporaryDirectory
+                .appendingPathComponent("missing-\(UUID().uuidString).sock").path,
+        ]) { _, new in new }
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        try process.run()
+        input.fileHandleForWriting.write(Data(#"{"toolName":"bash","toolInput":{"command":"true"}}"#.utf8))
+        input.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(output.fileHandleForReading.readDataToEndOfFile().isEmpty)
     }
 
     func testInterpreterEventMapping() {
@@ -416,6 +502,237 @@ final class CopilotAdapterTests: XCTestCase {
         let subagentStop = CopilotInterpreter.update(event: "SubagentStop", payload: Data("{}".utf8))
         XCTAssertEqual(subagentStop.statusLine, "Subagent finished")
         XCTAssertFalse(subagentStop.idle)
+    }
+}
+
+final class CopilotGateTests: XCTestCase {
+    private func connectionPair(label: String) throws -> (SocketConnection, Int32, DispatchQueue) {
+        var descriptors: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        let queue = DispatchQueue(label: label)
+        return (SocketConnection(fd: descriptors[0], queue: queue), descriptors[1], queue)
+    }
+
+    private func line(
+        type: WireType,
+        id: UUID = UUID(),
+        event: String,
+        sessionID: String = "copilot-session",
+        payload: String
+    ) throws -> Data {
+        let hook = HookEvent(
+            agent: "copilot",
+            event: event,
+            sessionID: sessionID,
+            cwd: "/tmp/project",
+            terminal: TerminalRef(termProgram: "vscode"),
+            payload: Data(payload.utf8)
+        )
+        return Data(try WireCodec.encodeLine(Envelope(id: id, type: type, body: hook)).dropLast())
+    }
+
+    private func readResponse(from fd: Int32) throws -> GateResponse {
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var bytes = [UInt8](repeating: 0, count: 4096)
+        let count = read(fd, &bytes, bytes.count)
+        XCTAssertGreaterThan(count, 0)
+        return try WireCodec.decode(
+            GateResponse.self,
+            from: Data(bytes.prefix(Int(count) - 1))
+        ).body
+    }
+
+    @MainActor
+    func testPermissionNotificationSequenceStaysPendingThenApproves() throws {
+        let (connection, peer, _) = try connectionPair(label: "CopilotGateTests.approve")
+        defer { close(peer) }
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let store = SessionStore()
+        let gates = GateCenter()
+        let router = IslandRouter(store: store, gates: gates, rules: ApprovalRulesStore(path: rulesPath))
+        let requestID = UUID()
+        let requestPayload = #"{"sessionId":"copilot-session","toolCallId":"call-1","toolName":"edit","toolInput":{"filePath":"/tmp/a.swift","oldString":"a","newString":"b"}}"#
+
+        router.handle(
+            line: try line(type: .gateRequest, id: requestID, event: "permissionRequest", payload: requestPayload),
+            connection: connection
+        )
+        XCTAssertEqual(store.requests.count, 1)
+        XCTAssertEqual(store.firstRequest?.details, .fileEdit(path: "/tmp/a.swift", old: "a", new: "b"))
+        XCTAssertFalse(store.firstRequest?.canAlwaysAllow ?? true)
+
+        let (notificationConnection, notificationPeer, _) = try connectionPair(label: "CopilotGateTests.notification")
+        defer {
+            notificationConnection.close()
+            close(notificationPeer)
+        }
+        router.handle(
+            line: try line(
+                type: .hookEvent,
+                event: "notification",
+                payload: #"{"notification_type":"permission_prompt","message":"Edit file"}"#
+            ),
+            connection: notificationConnection
+        )
+        XCTAssertEqual(store.requests.count, 1)
+        XCTAssertEqual(store.sessions[SessionID(agent: "copilot", raw: "copilot-session")]?.phase, .awaitingPermission)
+
+        router.approve(try XCTUnwrap(store.firstRequest))
+        XCTAssertTrue(store.requests.isEmpty)
+        XCTAssertEqual(try readResponse(from: peer).decision, .allow)
+    }
+
+    @MainActor
+    func testToolCompletionOnlyClearsMatchingPermission() throws {
+        let first = try connectionPair(label: "CopilotGateTests.completion.first")
+        let second = try connectionPair(label: "CopilotGateTests.completion.second")
+        let lifecycle = try connectionPair(label: "CopilotGateTests.completion.lifecycle")
+        defer {
+            close(first.1)
+            second.0.close()
+            close(second.1)
+            lifecycle.0.close()
+            close(lifecycle.1)
+        }
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let store = SessionStore()
+        let gates = GateCenter()
+        let router = IslandRouter(store: store, gates: gates, rules: ApprovalRulesStore(path: rulesPath))
+        let firstID = UUID()
+        let secondID = UUID()
+
+        router.handle(
+            line: try line(
+                type: .gateRequest,
+                id: firstID,
+                event: "permissionRequest",
+                payload: #"{"toolCallId":"call-1","toolName":"bash","toolInput":{"command":"echo first"}}"#
+            ),
+            connection: first.0
+        )
+        router.handle(
+            line: try line(
+                type: .gateRequest,
+                id: secondID,
+                event: "permissionRequest",
+                payload: #"{"toolCallId":"call-2","toolName":"bash","toolInput":{"command":"echo second"}}"#
+            ),
+            connection: second.0
+        )
+        router.handle(
+            line: try line(
+                type: .hookEvent,
+                event: "postToolUse",
+                payload: #"{"toolCallId":"call-1","toolName":"bash"}"#
+            ),
+            connection: lifecycle.0
+        )
+
+        XCTAssertEqual(try readResponse(from: first.1).decision, .ask)
+        XCTAssertEqual(store.requests.map(\.id), [secondID])
+        XCTAssertEqual(gates.pendingIDs, [secondID])
+    }
+
+    @MainActor
+    func testDuplicateRequestsShareOneCardAndDecision() throws {
+        let first = try connectionPair(label: "CopilotGateTests.duplicate.first")
+        let second = try connectionPair(label: "CopilotGateTests.duplicate.second")
+        defer {
+            close(first.1)
+            close(second.1)
+        }
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let store = SessionStore()
+        let gates = GateCenter()
+        let router = IslandRouter(store: store, gates: gates, rules: ApprovalRulesStore(path: rulesPath))
+        let payload = #"{"toolCallId":"same-call","toolName":"bash","toolInput":{"command":"rm file"}}"#
+
+        router.handle(
+            line: try line(type: .gateRequest, event: "permissionRequest", payload: payload),
+            connection: first.0
+        )
+        router.handle(
+            line: try line(type: .gateRequest, event: "permissionRequest", payload: payload),
+            connection: second.0
+        )
+        XCTAssertEqual(store.requests.count, 1)
+        XCTAssertEqual(gates.pendingIDs.count, 2)
+
+        router.deny(try XCTUnwrap(store.firstRequest))
+        XCTAssertEqual(try readResponse(from: first.1).decision, .deny)
+        XCTAssertEqual(try readResponse(from: second.1).decision, .deny)
+        XCTAssertTrue(gates.pendingIDs.isEmpty)
+    }
+
+    @MainActor
+    func testStopClearsStaleRequestAndDefersGate() throws {
+        let gate = try connectionPair(label: "CopilotGateTests.stop.gate")
+        let lifecycle = try connectionPair(label: "CopilotGateTests.stop.lifecycle")
+        defer {
+            close(gate.1)
+            lifecycle.0.close()
+            close(lifecycle.1)
+        }
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let store = SessionStore()
+        let gates = GateCenter()
+        let router = IslandRouter(store: store, gates: gates, rules: ApprovalRulesStore(path: rulesPath))
+
+        router.handle(
+            line: try line(
+                type: .gateRequest,
+                event: "permissionRequest",
+                payload: #"{"toolName":"bash","toolInput":{"command":"npm test"}}"#
+            ),
+            connection: gate.0
+        )
+        router.handle(
+            line: try line(type: .hookEvent, event: "agentStop", payload: "{}"),
+            connection: lifecycle.0
+        )
+
+        XCTAssertTrue(store.requests.isEmpty)
+        XCTAssertEqual(try readResponse(from: gate.1).decision, .ask)
+    }
+
+    @MainActor
+    func testDisconnectRemovesStaleRequest() async throws {
+        let gate = try connectionPair(label: "CopilotGateTests.disconnect")
+        defer { close(gate.1) }
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let store = SessionStore()
+        let gates = GateCenter()
+        let router = IslandRouter(store: store, gates: gates, rules: ApprovalRulesStore(path: rulesPath))
+        router.handle(
+            line: try line(
+                type: .gateRequest,
+                event: "permissionRequest",
+                payload: #"{"toolName":"bash","toolInput":{"command":"npm test"}}"#
+            ),
+            connection: gate.0
+        )
+        XCTAssertEqual(store.requests.count, 1)
+
+        gate.0.close()
+        await withCheckedContinuation { continuation in
+            gate.2.async { continuation.resume() }
+        }
+        for _ in 0..<20 where !store.requests.isEmpty {
+            await Task.yield()
+        }
+        XCTAssertTrue(store.requests.isEmpty)
+        XCTAssertTrue(gates.pendingIDs.isEmpty)
     }
 }
 

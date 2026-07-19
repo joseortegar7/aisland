@@ -130,7 +130,7 @@ public final class SessionStore {
             session.lastActivityAt = event.timestamp
             session.cwd = event.cwd
             session.terminal = event.terminal
-            // Copilot notify-only sessions (VS Code agent + CLI hooks).
+            // Copilot sessions (lifecycle notifications plus permission gates).
             if event.agent == "copilot" {
                 let update = CopilotInterpreter.update(event: event.event, payload: event.payload)
                 let wasAwaitingPermission = session.phase == .awaitingPermission
@@ -188,11 +188,22 @@ public final class SessionStore {
     // MARK: - Permission requests
 
     public func addRequest(_ request: PermissionRequest) {
-        onSound?(.needsPermission)
+        if let key = request.deduplicationKey,
+           requests.contains(where: { $0.sessionID == request.sessionID && $0.deduplicationKey == key }) {
+            return
+        }
+        let alreadyAwaiting = sessions[request.sessionID]?.phase == .awaitingPermission
+        if !alreadyAwaiting { onSound?(.needsPermission) }
         requests.append(request)
         mutate(request.sessionID) {
             $0.phase = .awaitingPermission
             $0.statusLine = "⚠ \(request.toolName): \(request.summary)"
+        }
+    }
+
+    public func matchingRequest(sessionID: SessionID, deduplicationKey: String) -> PermissionRequest? {
+        requests.first {
+            $0.sessionID == sessionID && $0.deduplicationKey == deduplicationKey
         }
     }
 

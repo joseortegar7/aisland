@@ -41,6 +41,7 @@ public final class IslandRouter {
         switch header.type {
         case .hookEvent:
             guard let envelope = try? WireCodec.decode(HookEvent.self, from: line) else { return }
+            resolveCopilotRequestsIfNeeded(for: envelope.body)
             store.apply(envelope.body)
         case .gateRequest:
             guard let envelope = try? WireCodec.decode(HookEvent.self, from: line) else {
@@ -66,6 +67,11 @@ public final class IslandRouter {
         let event = envelope.body
         store.apply(event)
         let sessionID = SessionID(agent: event.agent, raw: event.sessionID, host: event.host)
+
+        if event.agent == "copilot" {
+            handleCopilotGate(envelope, sessionID: sessionID, connection: connection)
+            return
+        }
 
         guard let call = ClaudeCodeInterpreter.toolCall(fromPayload: event.payload) else {
             respond(id: envelope.id, connection: connection, decision: .ask)
@@ -104,6 +110,53 @@ public final class IslandRouter {
             }
         case .holdWithoutStoredApproval:
             hold(envelope, call: call, sessionID: sessionID, connection: connection, canPersistApproval: false)
+        }
+    }
+
+    private func handleCopilotGate(
+        _ envelope: Envelope<HookEvent>,
+        sessionID: SessionID,
+        connection: SocketConnection
+    ) {
+        guard let request = CopilotInterpreter.permissionRequest(
+            id: envelope.id,
+            sessionID: sessionID,
+            payload: envelope.body.payload
+        ) else {
+            respond(id: envelope.id, connection: connection, decision: .ask)
+            return
+        }
+        if let key = request.deduplicationKey,
+           let existing = store.matchingRequest(sessionID: sessionID, deduplicationKey: key) {
+            gates.register(id: envelope.id, connection: connection, groupID: existing.id)
+            return
+        }
+        gates.register(id: envelope.id, connection: connection)
+        store.addRequest(request)
+        // Copilot's editor remains the primary interaction surface; reveal the
+        // card without making the nonactivating panel key.
+        store.onNeedsAttention?()
+    }
+
+    private func resolveCopilotRequestsIfNeeded(for event: HookEvent) {
+        guard event.agent == "copilot" else { return }
+        let sessionID = SessionID(agent: event.agent, raw: event.sessionID, host: event.host)
+        let matchingRequests: [PermissionRequest]
+        if CopilotInterpreter.resolvesAllPermissionGates(event: event.event) {
+            matchingRequests = store.requests.filter { $0.sessionID == sessionID }
+        } else if let toolCallID = CopilotInterpreter.completedToolCallID(
+            event: event.event,
+            payload: event.payload
+        ) {
+            matchingRequests = store.requests.filter {
+                $0.sessionID == sessionID && $0.deduplicationKey == toolCallID
+            }
+        } else {
+            return
+        }
+        for request in matchingRequests {
+            gates.respond(id: request.id, GateResponse(decision: .ask))
+            store.removeRequest(id: request.id)
         }
     }
 

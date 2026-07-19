@@ -104,7 +104,7 @@ Current gaps:
 - The router does not reject incompatible protocol versions.
 - Socket/router/gate round trips and fail-open behavior lack integration tests.
 - `remoteHello` is defined but not operational.
-- Native gate output is only implemented for Claude Code.
+- Native gate output is implemented for Claude Code and Copilot CLI.
 
 ### Sessions and routing - Partial
 
@@ -190,12 +190,16 @@ Current gaps:
 - No Codex usage provider.
 - Uninstall does not perform byte-identical backup restoration.
 
-### GitHub Copilot - Partial, notify-only
+### GitHub Copilot - Partial, lifecycle + approvals
 
 - Installs hooks for the VS Code agent in `~/.copilot/hooks/aisland.json`.
-- Merges CLI hooks into `~/.copilot/settings.json` while preserving foreign entries.
+- Uses that file as the sole aisland registration and removes legacy aisland
+  entries from `~/.copilot/settings.json` while preserving foreign entries.
 - Interprets session, prompt, tool, stop, notification, permission, and error events.
-- Permission events direct the user back to the terminal instead of gating.
+- Gates Copilot CLI `permissionRequest` events and emits native allow/deny output.
+- Reuses the existing permission cards without persistent always-allow.
+- Deduplicates repeated tool-call requests and clears gates on decisions,
+  disconnects, completion, cancellation, errors, and session end.
 
 Current gaps:
 

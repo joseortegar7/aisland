@@ -25,6 +25,35 @@ public struct GateResponse: Codable, Sendable {
     }
 }
 
+public enum NativeGateOutput {
+    public static func encode(agent: String, event: String, response: GateResponse) throws -> Data? {
+        guard response.decision == .allow || response.decision == .deny else { return nil }
+        let output: [String: Any]
+        switch agent {
+        case "claude-code":
+            output = [
+                "hookSpecificOutput": [
+                    "hookEventName": event,
+                    "permissionDecision": response.decision.rawValue,
+                    "permissionDecisionReason": response.reason ?? "Decided from aisland notch",
+                ],
+            ]
+        case "copilot":
+            if response.decision == .allow {
+                output = ["behavior": "allow"]
+            } else {
+                output = [
+                    "behavior": "deny",
+                    "message": response.reason ?? "Denied from aisland notch",
+                ]
+            }
+        default:
+            return nil
+        }
+        return try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
+    }
+}
+
 /// islandctl → app commands for development and testing.
 public struct CtlCommand: Codable, Sendable {
     public var command: String

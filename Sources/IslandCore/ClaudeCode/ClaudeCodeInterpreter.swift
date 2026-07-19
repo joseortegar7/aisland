@@ -22,6 +22,8 @@ public struct PermissionRequest: Identifiable, Sendable, Equatable {
     public let primaryArgument: String?
     /// False when Claude has an explicit ask rule that requires a fresh choice.
     public let canPersistApproval: Bool
+    /// Stable native tool-call identity used to collapse duplicate hook delivery.
+    public let deduplicationKey: String?
     public let receivedAt: Date
 
     public var isPlanReview: Bool {
@@ -41,6 +43,7 @@ public struct PermissionRequest: Identifiable, Sendable, Equatable {
         details: RequestDetails,
         primaryArgument: String? = nil,
         canPersistApproval: Bool = true,
+        deduplicationKey: String? = nil,
         receivedAt: Date = Date()
     ) {
         self.id = id
@@ -50,6 +53,7 @@ public struct PermissionRequest: Identifiable, Sendable, Equatable {
         self.details = details
         self.primaryArgument = primaryArgument
         self.canPersistApproval = canPersistApproval
+        self.deduplicationKey = deduplicationKey
         self.receivedAt = receivedAt
     }
 }
