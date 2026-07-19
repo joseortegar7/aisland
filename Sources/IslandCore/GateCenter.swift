@@ -16,7 +16,7 @@ public final class GateCenter {
 
     public func register(id: UUID, connection: SocketConnection) {
         pending[id] = connection
-        connection.onClosed = { [weak self] in
+        connection.addCloseHandler { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.pending.removeValue(forKey: id) != nil else { return }
                 self.onGateAborted?(id)

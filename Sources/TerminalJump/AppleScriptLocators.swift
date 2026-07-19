@@ -110,9 +110,18 @@ public struct TmuxLocator: TerminalLocator {
         guard parts.count >= 3 else { return .failed("unexpected tmux output") }
         let session = String(parts[1]); let window = String(parts[2])
 
-        _ = await Subprocess.run(tmux, socketArguments + ["select-window", "-t", "\(session):\(window)"])
-        _ = await Subprocess.run(tmux, socketArguments + ["select-pane", "-t", pane])
-        _ = await Subprocess.run(tmux, socketArguments + ["switch-client", "-t", session])
+        let selectWindow = await Subprocess.run(tmux, socketArguments + ["select-window", "-t", "\(session):\(window)"])
+        guard selectWindow.status == 0 else {
+            return .failed("tmux select-window: \(selectWindow.stderr)")
+        }
+        let selectPane = await Subprocess.run(tmux, socketArguments + ["select-pane", "-t", pane])
+        guard selectPane.status == 0 else {
+            return .failed("tmux select-pane: \(selectPane.stderr)")
+        }
+        let switchClient = await Subprocess.run(tmux, socketArguments + ["switch-client", "-t", session])
+        guard switchClient.status == 0 else {
+            return .failed("tmux switch-client: \(switchClient.stderr)")
+        }
 
         // Focus the terminal window hosting an attached client for this session.
         let clients = await Subprocess.run(tmux, socketArguments + [
@@ -126,7 +135,8 @@ public struct TmuxLocator: TerminalLocator {
             outer.itermSessionID = ref.itermSessionID
             for locator: any TerminalLocator in [ITerm2Locator(), AppleTerminalLocator()] where locator.score(outer) > 0 {
                 let result = await locator.focus(outer)
-                if result.succeeded { return .exact }
+                if result == .exact { return .exact }
+                if result.succeeded { return result }
             }
         }
         return .windowOnly

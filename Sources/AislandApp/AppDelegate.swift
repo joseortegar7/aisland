@@ -34,8 +34,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NotchActions {
         router.onNeedsAttention = { [weak self] in
             self?.controllers.first?.setExpanded(true)
         }
+        router.onError = { [weak self] message in
+            self?.notifyUser("aisland error", message)
+        }
         store.onNeedsAttention = { [weak self] in
-            self?.controllers.first?.setExpanded(true)
+            // Copilot is notify-only: its approval UI remains in VS Code, so
+            // reveal the island without taking keyboard focus from the IDE.
+            self?.controllers.first?.setExpanded(true, takeFocus: false)
         }
         router.onCtlJump = { [weak self] ref, reply in
             Task { [weak self] in
@@ -99,9 +104,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NotchActions {
         let questionID = question.id
         Task { [weak self] in
             let result = await self?.resolver.jump(to: terminal)
-            if result?.succeeded == true {
-                try? await Task.sleep(for: .milliseconds(350))
-                _ = await KeystrokeSender.selectOption(option)
+            guard result == .exact else {
+                NSLog("aisland: question answer requires exact terminal focus; got \(String(describing: result))")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(350))
+            guard await KeystrokeSender.selectOption(option) else {
+                NSLog("aisland: failed to send question option \(option)")
+                return
             }
             self?.store.removeQuestion(id: questionID)
         }

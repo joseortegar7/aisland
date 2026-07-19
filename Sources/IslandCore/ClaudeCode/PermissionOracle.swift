@@ -5,15 +5,20 @@ import Foundation
 /// gate with "ask" immediately (defer to Claude, zero friction). Only calls
 /// Claude would prompt for become notch approval cards.
 ///
-/// This is a best-effort mirror of the rule syntax: exact tool names,
-/// `Tool(prefix:*)` prefix rules, and `Tool(literal)` exact rules. Unknown
-/// syntax errs on the side of showing a card (never silently allows).
+/// This is a best-effort mirror of Claude's permission precedence and wildcard
+/// syntax. Unknown syntax errs on the side of showing a card.
 public struct PermissionOracle: Sendable {
     public enum PermissionMode: String, Sendable, Equatable {
         case `default`
         case acceptEdits
         case plan
+        case auto
+        case dontAsk
         case bypassPermissions
+
+        static func parse(_ value: String) -> PermissionMode? {
+            value == "manual" ? .default : PermissionMode(rawValue: value)
+        }
     }
 
     /// Tools Claude Code never prompts for.
@@ -27,50 +32,79 @@ public struct PermissionOracle: Sendable {
         case defer_
         /// Claude would prompt — hold the gate and show a card.
         case hold
+        /// An explicit ask rule requires a fresh decision; stored aisland rules
+        /// must not satisfy it automatically.
+        case holdWithoutStoredApproval
     }
 
     private let allowRules: [Rule]
+    private let denyRules: [Rule]
+    private let askRules: [Rule]
     private let defaultMode: PermissionMode?
 
     struct Rule: Sendable {
         let tool: String
         /// nil = bare tool rule ("Bash") allowing every input.
-        let spec: Spec?
-
-        enum Spec: Sendable {
-            case prefix(String)   // "git status:*" → prefix "git status"
-            case exact(String)
-        }
+        let spec: String?
     }
 
-    public init(allowPatterns: [String], defaultMode: PermissionMode? = nil) {
+    public init(
+        allowPatterns: [String],
+        denyPatterns: [String] = [],
+        askPatterns: [String] = [],
+        defaultMode: PermissionMode? = nil
+    ) {
         allowRules = allowPatterns.compactMap(Self.parse(pattern:))
+        denyRules = denyPatterns.compactMap(Self.parse(pattern:))
+        askRules = askPatterns.compactMap(Self.parse(pattern:))
         self.defaultMode = defaultMode
     }
 
-    /// Load allow rules the way Claude Code layers them: user settings, user
-    /// local, project, project local.
+    /// Load permission rules the way Claude Code layers them: user settings,
+    /// project settings, legacy local settings, then managed policy.
     public static func loadForProject(cwd: String, home: String = NSHomeDirectory()) -> PermissionOracle {
-        let candidates = [
+        var candidates = [
             "\(home)/.claude/settings.json",
             "\(home)/.claude/settings.local.json",
-            "\(cwd)/.claude/settings.json",
-            "\(cwd)/.claude/settings.local.json",
         ]
-        var patterns: [String] = []
+        let projectRoot = projectRoot(for: cwd)
+        candidates += [
+            "\(projectRoot)/.claude/settings.json",
+            "\(projectRoot)/.claude/settings.local.json",
+        ]
+        if projectRoot != URL(fileURLWithPath: cwd).standardizedFileURL.path {
+            // Claude still reads legacy settings left in the starting directory.
+            candidates += [
+                "\(cwd)/.claude/settings.json",
+                "\(cwd)/.claude/settings.local.json",
+            ]
+        }
+        candidates += managedSettingsPaths()
+
+        var allowPatterns: [String] = []
+        var denyPatterns: [String] = []
+        var askPatterns: [String] = []
         var defaultMode: PermissionMode?
-        for path in candidates {
+        var seenPaths: Set<String> = []
+        for path in candidates where seenPaths.insert(path).inserted {
             guard let data = FileManager.default.contents(atPath: path),
                   let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let permissions = object["permissions"] as? [String: Any]
             else { continue }
-            patterns.append(contentsOf: permissions["allow"] as? [String] ?? [])
+            allowPatterns.append(contentsOf: permissions["allow"] as? [String] ?? [])
+            denyPatterns.append(contentsOf: permissions["deny"] as? [String] ?? [])
+            askPatterns.append(contentsOf: permissions["ask"] as? [String] ?? [])
             if let rawMode = permissions["defaultMode"] as? String,
-               let mode = PermissionMode(rawValue: rawMode) {
+               let mode = PermissionMode.parse(rawMode) {
                 defaultMode = mode
             }
         }
-        return PermissionOracle(allowPatterns: patterns, defaultMode: defaultMode)
+        return PermissionOracle(
+            allowPatterns: allowPatterns,
+            denyPatterns: denyPatterns,
+            askPatterns: askPatterns,
+            defaultMode: defaultMode
+        )
     }
 
     public func verdict(
@@ -78,8 +112,20 @@ public struct PermissionOracle: Sendable {
         primaryArgument: String?,
         permissionMode: PermissionMode? = nil
     ) -> Verdict {
+        // Claude evaluates deny, ask, then allow. Never let an aisland rule
+        // bypass a deny or satisfy a newly-added explicit ask rule.
+        if matches(denyRules, toolName: toolName, primaryArgument: primaryArgument) {
+            return .defer_
+        }
+        if matches(askRules, toolName: toolName, primaryArgument: primaryArgument) {
+            return .holdWithoutStoredApproval
+        }
+        if matches(allowRules, toolName: toolName, primaryArgument: primaryArgument) {
+            return .defer_
+        }
+
         switch permissionMode ?? defaultMode ?? .default {
-        case .bypassPermissions, .plan:
+        case .bypassPermissions, .plan, .auto, .dontAsk:
             return .defer_
         case .acceptEdits where Self.editTools.contains(toolName):
             return .defer_
@@ -87,7 +133,7 @@ public struct PermissionOracle: Sendable {
             break
         }
         if Self.alwaysSafeTools.contains(toolName) { return .defer_ }
-        return matches(toolName: toolName, primaryArgument: primaryArgument) ? .defer_ : .hold
+        return .hold
     }
 
     private static let editTools: Set<String> = ["Edit", "MultiEdit", "Write", "NotebookEdit"]
@@ -95,15 +141,14 @@ public struct PermissionOracle: Sendable {
     /// Pure pattern matching, without the safe-tool shortcut. Also used by
     /// ApprovalRulesStore for island-side "always allow" rules.
     public func matches(toolName: String, primaryArgument: String?) -> Bool {
-        for rule in allowRules where rule.tool == toolName {
-            switch rule.spec {
-            case nil:
-                return true
-            case .prefix(let prefix):
-                if let argument = primaryArgument, argument.hasPrefix(prefix) { return true }
-            case .exact(let literal):
-                if primaryArgument == literal { return true }
-            }
+        matches(allowRules, toolName: toolName, primaryArgument: primaryArgument)
+    }
+
+    private func matches(_ rules: [Rule], toolName: String, primaryArgument: String?) -> Bool {
+        for rule in rules where rule.tool == toolName {
+            guard let spec = rule.spec else { return true }
+            guard let primaryArgument else { continue }
+            if Self.glob(spec, matches: primaryArgument) { return true }
         }
         return false
     }
@@ -114,15 +159,53 @@ public struct PermissionOracle: Sendable {
             return tool.isEmpty ? nil : Rule(tool: tool, spec: nil)
         }
         guard pattern.hasSuffix(")") else { return nil }
-        let tool = String(pattern[..<open])
+        let tool = pattern[..<open].trimmingCharacters(in: .whitespaces)
+        guard !tool.isEmpty else { return nil }
         var body = String(pattern[pattern.index(after: open)..<pattern.index(before: pattern.endIndex)])
         if body.hasSuffix(":*") {
             body.removeLast(2)
-            return Rule(tool: tool, spec: .prefix(body))
+            body += "*"
         }
         if body == "*" || body.isEmpty {
             return Rule(tool: tool, spec: nil)
         }
-        return Rule(tool: tool, spec: .exact(body))
+        return Rule(tool: tool, spec: body)
+    }
+
+    private static func glob(_ pattern: String, matches value: String) -> Bool {
+        let expression = NSRegularExpression.escapedPattern(for: pattern)
+            .replacingOccurrences(of: "\\*", with: ".*")
+        return value.range(of: "^\(expression)$", options: .regularExpression) != nil
+    }
+
+    private static func projectRoot(for cwd: String) -> String {
+        var directory = URL(fileURLWithPath: cwd).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            directory.deleteLastPathComponent()
+        }
+        while directory.path != "/" {
+            if FileManager.default.fileExists(atPath: directory.appendingPathComponent(".git").path) {
+                return directory.path
+            }
+            directory.deleteLastPathComponent()
+        }
+        return URL(fileURLWithPath: cwd).standardizedFileURL.path
+    }
+
+    private static func managedSettingsPaths() -> [String] {
+        let directory = URL(fileURLWithPath: "/Library/Application Support/ClaudeCode")
+        var paths = [directory.appendingPathComponent("managed-settings.json").path]
+        let dropIns = directory.appendingPathComponent("managed-settings.d")
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: dropIns,
+            includingPropertiesForKeys: nil
+        ) {
+            paths += entries
+                .filter { $0.pathExtension == "json" && !$0.lastPathComponent.hasPrefix(".") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .map { $0.path }
+        }
+        return paths
     }
 }

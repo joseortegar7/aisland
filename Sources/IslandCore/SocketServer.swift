@@ -9,10 +9,11 @@ public final class SocketConnection: @unchecked Sendable, Hashable {
     private let queue: DispatchQueue
     private var readSource: DispatchSourceRead?
     private var buffer = Data()
+    private let stateLock = NSLock()
     private var closed = false
+    private var closeHandlers: [() -> Void] = []
 
     var onLine: ((Data) -> Void)?
-    var onClosed: (() -> Void)?
 
     init(fd: Int32, queue: DispatchQueue) {
         self.fd = fd
@@ -54,13 +55,24 @@ public final class SocketConnection: @unchecked Sendable, Hashable {
 
     public func sendLine(_ data: Data) {
         queue.async { [self] in
-            guard !closed else { return }
+            guard !isClosed else { return }
             data.withUnsafeBytes { raw in
                 var offset = 0
                 while offset < raw.count {
                     let n = write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
-                    guard n > 0 else { return }
-                    offset += n
+                    if n > 0 {
+                        offset += n
+                        continue
+                    }
+                    if n < 0 && errno == EINTR { continue }
+                    if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                        let result = poll(&descriptor, 1, 1_000)
+                        if result > 0 { continue }
+                        if result < 0 && errno == EINTR { continue }
+                    }
+                    finish()
+                    return
                 }
             }
         }
@@ -70,12 +82,36 @@ public final class SocketConnection: @unchecked Sendable, Hashable {
         queue.async { self.finish() }
     }
 
+    func addCloseHandler(_ handler: @escaping () -> Void) {
+        stateLock.lock()
+        if closed {
+            stateLock.unlock()
+            handler()
+        } else {
+            closeHandlers.append(handler)
+            stateLock.unlock()
+        }
+    }
+
+    private var isClosed: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return closed
+    }
+
     private func finish() {
-        guard !closed else { return }
+        stateLock.lock()
+        guard !closed else {
+            stateLock.unlock()
+            return
+        }
         closed = true
+        let handlers = closeHandlers
+        closeHandlers.removeAll()
+        stateLock.unlock()
         readSource?.cancel()
         readSource = nil
-        onClosed?()
+        handlers.forEach { $0() }
     }
 
     public static func == (lhs: SocketConnection, rhs: SocketConnection) -> Bool { lhs === rhs }
@@ -151,13 +187,15 @@ public final class SocketServer: @unchecked Sendable {
             let clientFD = accept(listenFD, nil, nil)
             guard clientFD >= 0 else { return }
             _ = fcntl(clientFD, F_SETFL, fcntl(clientFD, F_GETFL) | O_NONBLOCK)
+            var noSigPipe: Int32 = 1
+            setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
             let connection = SocketConnection(fd: clientFD, queue: queue)
             connections.insert(connection)
             connection.onLine = { [weak self, weak connection] line in
                 guard let self, let connection else { return }
                 self.onLine?(line, connection)
             }
-            connection.onClosed = { [weak self, weak connection] in
+            connection.addCloseHandler { [weak self, weak connection] in
                 guard let self, let connection else { return }
                 self.connections.remove(connection)
             }

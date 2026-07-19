@@ -47,41 +47,43 @@ struct SessionCardView: View {
     let jump: () -> Void
 
     var body: some View {
-        Button(action: jump) {
-            HStack(alignment: .top, spacing: 8) {
-                Circle()
-                    .fill(indicatorColor)
-                    .frame(width: 7, height: 7)
-                    .padding(.top, 4)
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(session.title ?? session.projectName)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                        badge(session.agentDisplayName)
-                        if let terminal = session.terminalDisplayName {
-                            badge(terminal)
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Button(action: jump) {
+                HStack(alignment: .top, spacing: 8) {
+                    Circle()
+                        .fill(indicatorColor)
+                        .frame(width: 7, height: 7)
+                        .padding(.top, 4)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(session.title ?? session.projectName)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                            badge(session.agentDisplayName)
+                            if let terminal = session.terminalDisplayName {
+                                badge(terminal)
+                            }
+                            Spacer()
+                            Text(elapsed(at: context.date))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.4))
                         }
-                        Spacer()
-                        Text(elapsed)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.4))
-                    }
-                    if let status = statusText {
-                        Text(status)
-                            .font(.system(size: 11))
-                            .foregroundStyle(session.phase == .idle ? .green.opacity(0.85) : .white.opacity(0.6))
-                            .lineLimit(1)
+                        if let status = statusText {
+                            Text(status)
+                                .font(.system(size: 11))
+                                .foregroundStyle(session.phase == .idle ? .green.opacity(0.85) : .white.opacity(0.6))
+                                .lineLimit(1)
+                        }
                     }
                 }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                .contentShape(RoundedRectangle(cornerRadius: 10))
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-            .contentShape(RoundedRectangle(cornerRadius: 10))
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
     }
 
     private var statusText: String? {
@@ -105,8 +107,8 @@ struct SessionCardView: View {
         }
     }
 
-    private var elapsed: String {
-        let seconds = Int(Date().timeIntervalSince(session.startedAt))
+    private func elapsed(at date: Date) -> String {
+        let seconds = max(0, Int(date.timeIntervalSince(session.startedAt)))
         if seconds < 60 { return "\(seconds)s" }
         if seconds < 3600 { return "\(seconds / 60)m" }
         return "\(seconds / 3600)h\((seconds % 3600) / 60)m"
@@ -310,7 +312,7 @@ struct PermissionCardView: View {
         HStack(spacing: 8) {
             actionButton("Deny ⌘N", background: .white.opacity(0.1), foreground: .white.opacity(0.85), action: deny)
                 .keyboardShortcut("n", modifiers: .command)
-            if !request.isPlanReview {
+            if !request.isPlanReview && request.canAlwaysAllow {
                 actionButton("Always ⌘A", background: .white.opacity(0.1), foreground: accent, action: alwaysAllow)
                     .keyboardShortcut("a", modifiers: .command)
             }

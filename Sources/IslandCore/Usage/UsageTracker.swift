@@ -117,6 +117,7 @@ public final class UsageTracker {
 
     public func refresh() async {
         guard let token = await Self.loadAccessToken() else {
+            snapshot = nil
             NSLog("aisland usage: no OAuth token reachable; hiding quota strip")
             return
         }
@@ -125,18 +126,24 @@ public final class UsageTracker {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 15
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                snapshot = nil
                 NSLog("aisland usage: endpoint returned %d", (response as? HTTPURLResponse)?.statusCode ?? -1)
                 return
             }
-            if let parsed = UsageParser.parse(data) {
-                snapshot = parsed
-                NSLog("aisland usage: %@", parsed.stripText ?? "n/a")
+            guard let parsed = UsageParser.parse(data) else {
+                snapshot = nil
+                NSLog("aisland usage: endpoint returned an invalid response")
+                return
             }
+            snapshot = parsed
+            NSLog("aisland usage: %@", parsed.stripText ?? "n/a")
         } catch {
+            snapshot = nil
             NSLog("aisland usage: fetch failed: \(error.localizedDescription)")
         }
     }

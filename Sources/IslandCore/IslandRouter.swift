@@ -11,6 +11,7 @@ public final class IslandRouter {
 
     /// Fired when a gate starts waiting on the user (UI should auto-expand).
     public var onNeedsAttention: (() -> Void)?
+    public var onError: ((String) -> Void)?
 
     /// Overridable for tests; defaults to reading Claude's real settings.
     public var oracleProvider: @Sendable (String) -> PermissionOracle = { cwd in
@@ -85,13 +86,6 @@ public final class IslandRouter {
             return
         }
 
-        // Island-side "always allow" rules answer instantly.
-        if rules.allows(toolName: call.name, primaryArgument: call.primaryArgument) {
-            store.setStatus(sessionID, "✓ Auto-allowed \(call.name): \(call.summary)")
-            respond(id: envelope.id, connection: connection, decision: .allow, reason: "aisland always-allow rule")
-            return
-        }
-
         let oracle = oracleProvider(event.cwd)
         switch oracle.verdict(
             toolName: call.name,
@@ -102,17 +96,36 @@ public final class IslandRouter {
             store.setStatus(sessionID, "\(call.name): \(call.summary)")
             respond(id: envelope.id, connection: connection, decision: .ask)
         case .hold:
-            let request = PermissionRequest(
-                id: envelope.id,
-                sessionID: sessionID,
-                toolName: call.name,
-                summary: call.summary,
-                details: call.details
-            )
-            gates.register(id: envelope.id, connection: connection)
-            store.addRequest(request)
-            onNeedsAttention?()
+            if rules.allows(toolName: call.name, primaryArgument: call.primaryArgument) {
+                store.setStatus(sessionID, "✓ Auto-allowed \(call.name): \(call.summary)")
+                respond(id: envelope.id, connection: connection, decision: .allow, reason: "aisland always-allow rule")
+            } else {
+                hold(envelope, call: call, sessionID: sessionID, connection: connection, canPersistApproval: true)
+            }
+        case .holdWithoutStoredApproval:
+            hold(envelope, call: call, sessionID: sessionID, connection: connection, canPersistApproval: false)
         }
+    }
+
+    private func hold(
+        _ envelope: Envelope<HookEvent>,
+        call: ClaudeCodeInterpreter.ToolCall,
+        sessionID: SessionID,
+        connection: SocketConnection,
+        canPersistApproval: Bool
+    ) {
+        let request = PermissionRequest(
+            id: envelope.id,
+            sessionID: sessionID,
+            toolName: call.name,
+            summary: call.summary,
+            details: call.details,
+            primaryArgument: call.primaryArgument,
+            canPersistApproval: canPersistApproval
+        )
+        gates.register(id: envelope.id, connection: connection)
+        store.addRequest(request)
+        onNeedsAttention?()
     }
 
     /// App-layer hook for `islandctl jump` diagnostics: perform a jump for the
@@ -164,13 +177,21 @@ public final class IslandRouter {
 
     /// Approve + persist an always-allow rule so future matching calls skip the card.
     public func alwaysAllow(_ request: PermissionRequest) {
-        let primary: String?
-        switch request.details {
-        case .bash(let command): primary = command
-        case .fileEdit(let path, _, _), .fileWrite(let path, _): primary = path
-        default: primary = nil
+        guard request.canPersistApproval else {
+            onError?("Claude requires a fresh decision for this operation.")
+            return
         }
-        rules.addRule(toolName: request.toolName, primaryArgument: primary)
-        approve(request)
+        guard let primaryArgument = request.primaryArgument, !primaryArgument.isEmpty else {
+            NSLog("aisland: refusing to create an unscoped always-allow rule for \(request.toolName)")
+            return
+        }
+        do {
+            try rules.addRule(toolName: request.toolName, primaryArgument: primaryArgument)
+            approve(request)
+        } catch {
+            let message = "Could not save always-allow rule: \(error.localizedDescription)"
+            store.setStatus(request.sessionID, "⚠ \(message)")
+            onError?(message)
+        }
     }
 }

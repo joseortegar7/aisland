@@ -83,11 +83,12 @@ public final class NotchController {
         applyFrame(animated: true)
     }
 
-    public func setExpanded(_ expanded: Bool) {
-        guard model.isExpanded != expanded else { return }
-        model.isExpanded = expanded
-        applyFrame(animated: true)
-        if expanded {
+    public func setExpanded(_ expanded: Bool, takeFocus: Bool = true) {
+        if model.isExpanded != expanded {
+            model.isExpanded = expanded
+            applyFrame(animated: true)
+        }
+        if expanded && takeFocus {
             // Let approval buttons receive ⌘Y/⌘N without activating the app.
             panel.makeKey()
         }
@@ -103,8 +104,8 @@ public final class NotchController {
         if hovering {
             setExpanded(true)
         } else {
-            // Never auto-collapse while an approval is waiting.
-            guard model.store.requests.isEmpty, !model.isSettingsPresented else { return }
+            // Never auto-collapse while an approval or question is waiting.
+            guard !model.store.needsAttention, !model.isSettingsPresented else { return }
             // Window resizing can make AppKit regenerate tracking areas and
             // emit a synthetic exit. Ignore it unless the pointer is actually
             // outside the panel in global screen coordinates.
@@ -114,7 +115,7 @@ public final class NotchController {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard !Task.isCancelled else { return }
                 guard let self,
-                      self.model.store.requests.isEmpty,
+                      !self.model.store.needsAttention,
                       !self.model.isSettingsPresented,
                       !self.pointerIsInsidePanel
                 else { return }

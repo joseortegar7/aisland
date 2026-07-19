@@ -12,7 +12,7 @@ enum AppActivation {
             guard let app = NSRunningApplication(processIdentifier: pid),
                   app.activationPolicy == .regular
             else { continue }
-            return app.activate(options: [.activateIgnoringOtherApps])
+            return app.activate()
         }
         return false
     }
@@ -22,7 +22,7 @@ enum AppActivation {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
             return false
         }
-        return app.activate(options: [.activateIgnoringOtherApps])
+        return app.activate()
     }
 
     static func firstExisting(_ paths: [String]) -> String? {

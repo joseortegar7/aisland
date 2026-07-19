@@ -21,8 +21,9 @@ final class PermissionOracleTests: XCTestCase {
     }
 
     func testPrefixRule() {
-        let oracle = PermissionOracle(allowPatterns: ["Bash(git status:*)"])
+        let oracle = PermissionOracle(allowPatterns: ["Bash(git status:*)", "Bash(npm run *)"])
         XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git status --short"), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "npm run lint"), .defer_)
         XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push"), .hold)
     }
 
@@ -41,6 +42,22 @@ final class PermissionOracleTests: XCTestCase {
         let oracle = PermissionOracle(allowPatterns: [])
         XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "rm -rf /", permissionMode: .bypassPermissions), .defer_)
         XCTAssertEqual(oracle.verdict(toolName: "mcp__unknown", primaryArgument: nil, permissionMode: .plan), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push", permissionMode: .auto), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push", permissionMode: .dontAsk), .defer_)
+    }
+
+    func testDenyAndAskTakePrecedenceOverAllow() {
+        let oracle = PermissionOracle(
+            allowPatterns: ["Bash(git *)"],
+            denyPatterns: ["Bash(git push *)"],
+            askPatterns: ["Bash(git status *)"]
+        )
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push origin main"), .defer_)
+        XCTAssertEqual(
+            oracle.verdict(toolName: "Bash", primaryArgument: "git status --short"),
+            .holdWithoutStoredApproval
+        )
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git fetch"), .defer_)
     }
 
     func testAcceptEditsDefersEditsButStillHoldsBash() {
@@ -61,6 +78,25 @@ final class PermissionOracleTests: XCTestCase {
         let oracle = PermissionOracle.loadForProject(cwd: home.path, home: home.path)
         XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push"), .defer_)
         XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push", permissionMode: .default), .hold)
+    }
+
+    func testLoadsRulesFromRepositoryRoot() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("oracle-root-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        let nested = root.appendingPathComponent("Sources/Feature")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data(#"{"permissions":{"deny":["Bash(rm *)"],"ask":["Bash(git push *)"],"defaultMode":"manual"}}"#.utf8)
+            .write(to: root.appendingPathComponent(".claude/settings.json"))
+
+        let oracle = PermissionOracle.loadForProject(cwd: nested.path, home: root.appendingPathComponent("home").path)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "rm file"), .defer_)
+        XCTAssertEqual(
+            oracle.verdict(toolName: "Bash", primaryArgument: "git push origin main"),
+            .holdWithoutStoredApproval
+        )
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "make deploy"), .hold)
     }
 }
 
@@ -136,6 +172,43 @@ final class IslandRouterPermissionModeTests: XCTestCase {
         XCTAssertTrue(gates.pendingIDs.isEmpty)
         XCTAssertTrue(store.requests.isEmpty)
     }
+
+    @MainActor
+    func testDenyRuleWinsOverStoredApproval() throws {
+        var descriptors: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        defer { close(descriptors[1]) }
+
+        let connection = SocketConnection(fd: descriptors[0], queue: DispatchQueue(label: "deny-rule-test"))
+        let rulesPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: rulesPath) }
+        let rules = ApprovalRulesStore(path: rulesPath)
+        try rules.addRule(toolName: "Bash", primaryArgument: "rm file")
+        let gates = GateCenter()
+        let store = SessionStore()
+        let router = IslandRouter(store: store, gates: gates, rules: rules)
+        router.oracleProvider = { _ in
+            PermissionOracle(allowPatterns: [], denyPatterns: ["Bash(rm *)"])
+        }
+        let payload = Data(#"{"tool_name":"Bash","tool_input":{"command":"rm file"}}"#.utf8)
+        let event = HookEvent(
+            agent: "claude-code", event: "PreToolUse", sessionID: "deny-session",
+            cwd: "/tmp", terminal: TerminalRef(), payload: payload
+        )
+        let line = try WireCodec.encodeLine(Envelope(type: .gateRequest, body: event))
+
+        router.handle(line: Data(line.dropLast()), connection: connection)
+
+        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(descriptors[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var bytes = [UInt8](repeating: 0, count: 4096)
+        let count = read(descriptors[1], &bytes, bytes.count)
+        XCTAssertGreaterThan(count, 0)
+        let response = try WireCodec.decode(GateResponse.self, from: Data(bytes.prefix(Int(count) - 1)))
+        XCTAssertEqual(response.body.decision, .ask)
+        XCTAssertTrue(store.requests.isEmpty)
+    }
 }
 
 final class Phase2ParsingTests: XCTestCase {
@@ -186,16 +259,61 @@ final class ApprovalRulesStoreTests: XCTestCase {
         let store = ApprovalRulesStore(path: path)
         XCTAssertFalse(store.allows(toolName: "Bash", primaryArgument: "git push"))
 
-        store.addRule(toolName: "Bash", primaryArgument: "git push origin main")
-        XCTAssertTrue(store.allows(toolName: "Bash", primaryArgument: "git status"), "prefix rule on first token")
+        try store.addRule(toolName: "Bash", primaryArgument: "git push origin main")
+        XCTAssertTrue(store.allows(toolName: "Bash", primaryArgument: "git push origin main"))
+        XCTAssertFalse(store.allows(toolName: "Bash", primaryArgument: "git status"))
         XCTAssertFalse(store.allows(toolName: "Bash", primaryArgument: "npm test"))
 
-        store.addRule(toolName: "WebFetch", primaryArgument: nil)
+        try store.addRule(toolName: "WebFetch", primaryArgument: "https://x.test")
         XCTAssertTrue(store.allows(toolName: "WebFetch", primaryArgument: "https://x.test"))
+        XCTAssertFalse(store.allows(toolName: "WebFetch", primaryArgument: "https://other.test"))
 
         // Reload from disk.
         let reloaded = ApprovalRulesStore(path: path)
-        XCTAssertEqual(reloaded.patterns.sorted(), ["Bash(git:*)", "WebFetch"])
+        XCTAssertTrue(reloaded.allows(toolName: "Bash", primaryArgument: "git push origin main"))
+        XCTAssertFalse(reloaded.allows(toolName: "Bash", primaryArgument: "git status"))
+        XCTAssertEqual(
+            reloaded.patterns.sorted(),
+            ["Bash(git push origin main)", "WebFetch(https://x.test)"]
+        )
+    }
+
+    @MainActor
+    func testWriteFailureDoesNotInstallRuleInMemory() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-parent-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try Data("not a directory".utf8).write(to: parent)
+        let store = ApprovalRulesStore(path: parent.appendingPathComponent("rules.json").path)
+
+        XCTAssertThrowsError(try store.addRule(toolName: "Bash", primaryArgument: "git push"))
+        XCTAssertFalse(store.allows(toolName: "Bash", primaryArgument: "git push"))
+        XCTAssertTrue(store.patterns.isEmpty)
+    }
+}
+
+final class GateCenterTests: XCTestCase {
+    @MainActor
+    func testAlreadyClosedConnectionAbortsNewGate() async {
+        var descriptors: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        defer { close(descriptors[1]) }
+
+        let queue = DispatchQueue(label: "GateCenterTests")
+        let connection = SocketConnection(fd: descriptors[0], queue: queue)
+        connection.start()
+        connection.close()
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
+        }
+
+        let aborted = expectation(description: "closed gate removed")
+        let gates = GateCenter()
+        gates.onGateAborted = { _ in aborted.fulfill() }
+        gates.register(id: UUID(), connection: connection)
+
+        await fulfillment(of: [aborted], timeout: 1)
+        XCTAssertTrue(gates.pendingIDs.isEmpty)
     }
 }
 
@@ -232,7 +350,8 @@ final class CopilotAdapterTests: XCTestCase {
         XCTAssertNotNil(hooks["SessionEnd"])
         XCTAssertNotNil(hooks["SubagentStart"])
         XCTAssertNotNil(hooks["PermissionRequest"])
-        XCTAssertNotNil(hooks["permissionRequest"])
+        XCTAssertNil(hooks["permissionRequest"])
+        XCTAssertEqual(hookJSON["version"] as? Int, 1)
         for value in hooks.values {
             let entries = value as? [[String: Any]] ?? []
             XCTAssertTrue(entries.allSatisfy { ($0["command"] as? String)?.contains("exit 0") == true })
@@ -266,6 +385,7 @@ final class CopilotAdapterTests: XCTestCase {
         let permission = CopilotInterpreter.update(event: "permissionRequest", payload: Data("{}".utf8))
         XCTAssertEqual(permission.statusLine, "⚠ Needs approval in terminal")
         XCTAssertTrue(permission.needsAttention)
+        XCTAssertFalse(permission.resolvesAttention)
 
         let nestedPermission = CopilotInterpreter.update(
             event: "PermissionRequest",
@@ -273,6 +393,13 @@ final class CopilotAdapterTests: XCTestCase {
         )
         XCTAssertEqual(nestedPermission.statusLine, "⚠ Needs approval for terminal")
         XCTAssertTrue(nestedPermission.needsAttention)
+
+        let permissionNotification = CopilotInterpreter.update(
+            event: "notification",
+            payload: Data(#"{"notification_type":"permission_prompt","message":"Edit file"}"#.utf8)
+        )
+        XCTAssertTrue(permissionNotification.needsAttention)
+        XCTAssertFalse(permissionNotification.resolvesAttention)
 
         let realVSCodeTool = CopilotInterpreter.update(
             event: "PostToolUse",

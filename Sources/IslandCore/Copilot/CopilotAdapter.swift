@@ -15,7 +15,7 @@ public struct CopilotHookInstaller: Sendable {
     static let pascalEvents = [
         "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse",
         "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStart", "SubagentStop",
-        "PermissionRequest", "permissionRequest",
+        "PermissionRequest",
     ]
     static let camelEvents = [
         "sessionStart", "sessionEnd", "userPromptSubmit", "userPromptSubmitted",
@@ -54,25 +54,23 @@ public struct CopilotHookInstaller: Sendable {
     }
 
     public func install() throws {
-        // Surface 1: our own hook file for the VS Code agent.
-        try FileManager.default.createDirectory(atPath: hooksDirectory, withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(atPath: legacyHookFilePath)
         let hookEntries = Self.pascalEvents.reduce(into: [String: Any]()) { result, event in
             result[event] = [["type": "command", "command": command(event: event)]]
         }
-        let hookFile: [String: Any] = ["hooks": hookEntries]
+        let hookFile: [String: Any] = ["version": 1, "hooks": hookEntries]
         let hookData = try JSONSerialization.data(withJSONObject: hookFile, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        try hookData.write(to: URL(fileURLWithPath: hookFilePath), options: .atomic)
 
-        // Surface 2: merge into settings.json for the CLI.
         var settings: [String: Any] = [:]
-        if let data = FileManager.default.contents(atPath: settingsPath),
-           let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            settings = existing
-            let backupPath = settingsPath + ".aisland.bak"
-            if !FileManager.default.fileExists(atPath: backupPath) {
-                try? data.write(to: URL(fileURLWithPath: backupPath))
+        var existingSettingsData: Data?
+        if let data = FileManager.default.contents(atPath: settingsPath) {
+            guard let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [
+                    NSFilePathErrorKey: settingsPath,
+                    NSLocalizedDescriptionKey: "Existing Copilot settings are not valid JSON.",
+                ])
             }
+            settings = existing
+            existingSettingsData = data
         }
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         for event in Self.camelEvents {
@@ -89,7 +87,17 @@ public struct CopilotHookInstaller: Sendable {
         }
         settings["hooks"] = hooks
         let settingsData = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+
+        try FileManager.default.createDirectory(atPath: hooksDirectory, withIntermediateDirectories: true)
+        if let existingSettingsData {
+            let backupPath = settingsPath + ".aisland.bak"
+            if !FileManager.default.fileExists(atPath: backupPath) {
+                try existingSettingsData.write(to: URL(fileURLWithPath: backupPath), options: .atomic)
+            }
+        }
         try settingsData.write(to: URL(fileURLWithPath: settingsPath), options: .atomic)
+        try hookData.write(to: URL(fileURLWithPath: hookFilePath), options: .atomic)
+        try? FileManager.default.removeItem(atPath: legacyHookFilePath)
     }
 
     public func uninstall() throws {
@@ -134,6 +142,7 @@ public enum CopilotInterpreter {
         public let title: String?
         public let idle: Bool
         public let needsAttention: Bool
+        public let resolvesAttention: Bool
     }
 
     public static func update(event: String, payload: Data) -> Update {
@@ -143,7 +152,7 @@ public enum CopilotInterpreter {
         }
         switch event {
         case "Stop", "agentStop":
-            return Update(statusLine: "Done — click to jump", title: nil, idle: true, needsAttention: false)
+            return Update(statusLine: "Done — click to jump", title: nil, idle: true, needsAttention: false, resolvesAttention: true)
         case "UserPromptSubmit", "userPromptSubmit", "userPromptSubmitted":
             let prompt = value(["prompt", "message", "userPrompt"])
             let flattened = prompt?.replacingOccurrences(of: "\n", with: " ")
@@ -151,34 +160,45 @@ public enum CopilotInterpreter {
                 statusLine: flattened.map { "You: " + String($0.prefix(100)) },
                 title: flattened.map { String($0.prefix(60)) },
                 idle: false,
-                needsAttention: false
+                needsAttention: false,
+                resolvesAttention: false
             )
         case "PermissionRequest", "permissionRequest":
             let tool = value(["tool_name", "toolName", "name"])
             let status = tool.map { "⚠ Needs approval for \($0)" } ?? "⚠ Needs approval in terminal"
-            return Update(statusLine: status, title: nil, idle: false, needsAttention: true)
-        case "notification", "errorOccurred":
+            return Update(statusLine: status, title: nil, idle: false, needsAttention: true, resolvesAttention: false)
+        case "notification":
             let message = value(["message", "text"])
-            return Update(statusLine: message.map { String($0.prefix(120)) }, title: nil, idle: false, needsAttention: false)
+            let notificationType = value(["notification_type", "notificationType"])
+            return Update(
+                statusLine: message.map { String($0.prefix(120)) },
+                title: nil,
+                idle: false,
+                needsAttention: notificationType == "permission_prompt",
+                resolvesAttention: false
+            )
+        case "errorOccurred":
+            let message = value(["message", "text"])
+            return Update(statusLine: message.map { String($0.prefix(120)) }, title: nil, idle: false, needsAttention: false, resolvesAttention: true)
         case "SessionStart", "sessionStart":
-            return Update(statusLine: "Session started", title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: "Session started", title: nil, idle: false, needsAttention: false, resolvesAttention: false)
         case "PreToolUse", "preToolUse":
             let tool = value(["tool_name", "toolName", "name"])
-            return Update(statusLine: tool.map { "Running \($0)" }, title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: tool.map { "Running \($0)" }, title: nil, idle: false, needsAttention: false, resolvesAttention: false)
         case "PostToolUse", "postToolUse":
             let tool = value(["tool_name", "toolName", "name"])
-            return Update(statusLine: tool.map { "Finished \($0)" }, title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: tool.map { "Finished \($0)" }, title: nil, idle: false, needsAttention: false, resolvesAttention: true)
         case "PostToolUseFailure", "postToolUseFailure":
             let tool = value(["tool_name", "toolName", "name"])
-            return Update(statusLine: "Failed \(tool ?? "tool")", title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: "Failed \(tool ?? "tool")", title: nil, idle: false, needsAttention: false, resolvesAttention: true)
         case "SubagentStart", "subagentStart":
-            return Update(statusLine: "Subagent started", title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: "Subagent started", title: nil, idle: false, needsAttention: false, resolvesAttention: false)
         case "SubagentStop", "subagentStop":
-            return Update(statusLine: "Subagent finished", title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: "Subagent finished", title: nil, idle: false, needsAttention: false, resolvesAttention: false)
         case "preCompact":
-            return Update(statusLine: "Compacting context", title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: "Compacting context", title: nil, idle: false, needsAttention: false, resolvesAttention: false)
         default:
-            return Update(statusLine: nil, title: nil, idle: false, needsAttention: false)
+            return Update(statusLine: nil, title: nil, idle: false, needsAttention: false, resolvesAttention: false)
         }
     }
 

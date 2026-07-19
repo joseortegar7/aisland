@@ -42,7 +42,16 @@ public struct ClaudeHookInstaller: Sendable {
     }
 
     public func install() throws {
-        var settings = readSettings() ?? [:]
+        var settings: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: settingsPath) {
+            guard let existing = readSettings() else {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [
+                    NSFilePathErrorKey: settingsPath,
+                    NSLocalizedDescriptionKey: "Existing Claude settings are not valid JSON.",
+                ])
+            }
+            settings = existing
+        }
         try backupOnce()
 
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
@@ -92,10 +101,17 @@ public struct ClaudeHookInstaller: Sendable {
                 result[event] = value
                 continue
             }
-            let kept = matchers.filter { matcher in
-                let commands = (matcher["hooks"] as? [[String: Any]] ?? [])
-                    .compactMap { $0["command"] as? String }
-                return !commands.contains { $0.contains("island-shim") }
+            let kept = matchers.compactMap { matcher -> [String: Any]? in
+                guard let entries = matcher["hooks"] as? [[String: Any]] else {
+                    return matcher
+                }
+                let foreignEntries = entries.filter {
+                    ($0["command"] as? String)?.contains("island-shim") != true
+                }
+                guard !foreignEntries.isEmpty else { return nil }
+                var updated = matcher
+                updated["hooks"] = foreignEntries
+                return updated
             }
             if !kept.isEmpty { result[event] = kept }
         }

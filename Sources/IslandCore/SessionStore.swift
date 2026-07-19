@@ -136,11 +136,13 @@ public final class SessionStore {
                 let wasAwaitingPermission = session.phase == .awaitingPermission
                 if let status = update.statusLine {
                     session.statusLine = status
-                } else if wasAwaitingPermission && !update.needsAttention {
+                } else if wasAwaitingPermission && update.resolvesAttention {
                     session.statusLine = nil
                 }
                 if session.title == nil, let title = update.title { session.title = title }
-                session.phase = update.needsAttention ? .awaitingPermission : (update.idle ? .idle : .working)
+                let remainsAwaitingPermission = update.needsAttention
+                    || (wasAwaitingPermission && !update.resolvesAttention)
+                session.phase = remainsAwaitingPermission ? .awaitingPermission : (update.idle ? .idle : .working)
                 sessions[id] = session
                 if update.needsAttention && !wasAwaitingPermission {
                     onSound?(.needsPermission)

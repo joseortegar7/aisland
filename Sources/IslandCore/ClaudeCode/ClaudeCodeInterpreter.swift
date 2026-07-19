@@ -18,6 +18,10 @@ public struct PermissionRequest: Identifiable, Sendable, Equatable {
     /// Human summary of the tool input: the command, the file path, the URL…
     public let summary: String
     public let details: RequestDetails
+    /// Argument used to scope an exact always-allow rule.
+    public let primaryArgument: String?
+    /// False when Claude has an explicit ask rule that requires a fresh choice.
+    public let canPersistApproval: Bool
     public let receivedAt: Date
 
     public var isPlanReview: Bool {
@@ -25,12 +29,27 @@ public struct PermissionRequest: Identifiable, Sendable, Equatable {
         return false
     }
 
-    public init(id: UUID, sessionID: SessionID, toolName: String, summary: String, details: RequestDetails, receivedAt: Date = Date()) {
+    public var canAlwaysAllow: Bool {
+        canPersistApproval && primaryArgument?.isEmpty == false
+    }
+
+    public init(
+        id: UUID,
+        sessionID: SessionID,
+        toolName: String,
+        summary: String,
+        details: RequestDetails,
+        primaryArgument: String? = nil,
+        canPersistApproval: Bool = true,
+        receivedAt: Date = Date()
+    ) {
         self.id = id
         self.sessionID = sessionID
         self.toolName = toolName
         self.summary = summary
         self.details = details
+        self.primaryArgument = primaryArgument
+        self.canPersistApproval = canPersistApproval
         self.receivedAt = receivedAt
     }
 }

@@ -75,7 +75,7 @@ final class SessionStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testCopilotPermissionRequestsAttentionAndClearsOnActivity() {
+    func testCopilotPermissionStaysPendingThroughNotificationAndClearsOnCompletion() {
         let store = SessionStore()
         var sounds: [SoundEvent] = []
         var attentionCount = 0
@@ -98,6 +98,14 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(store.ordered.first?.id, waitingID)
         XCTAssertTrue(store.needsAttention)
         XCTAssertEqual(sounds.filter { $0 == .needsPermission }.count, 1)
+        XCTAssertEqual(attentionCount, 1)
+
+        store.apply(HookEvent(
+            agent: "copilot", event: "notification", sessionID: "waiting",
+            cwd: "/tmp/waiting", terminal: terminal,
+            payload: Data(#"{"notification_type":"permission_prompt","message":"Edit file"}"#.utf8)
+        ))
+        XCTAssertEqual(store.sessions[waitingID]?.phase, .awaitingPermission)
         XCTAssertEqual(attentionCount, 1)
 
         store.apply(HookEvent(
