@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aisland}",
+            "name": "Debug island-shim",
+            "target": "island-shim",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug island-shim"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aisland}",
+            "name": "Release island-shim",
+            "target": "island-shim",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release island-shim"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aisland}",
+            "name": "Debug islandctl",
+            "target": "islandctl",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug islandctl"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aisland}",
+            "name": "Release islandctl",
+            "target": "islandctl",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release islandctl"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aisland}",
+            "name": "Debug aisland",
+            "target": "aisland",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug aisland"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:aisland}",
+            "name": "Release aisland",
+            "target": "aisland",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release aisland"
+        }
+    ]
+}

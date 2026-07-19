@@ -1,0 +1,360 @@
+import XCTest
+@testable import IslandCore
+
+final class PermissionOracleTests: XCTestCase {
+    func testSafeToolsAlwaysDefer() {
+        let oracle = PermissionOracle(allowPatterns: [])
+        XCTAssertEqual(oracle.verdict(toolName: "Read", primaryArgument: "/etc/hosts"), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Grep", primaryArgument: "foo"), .defer_)
+    }
+
+    func testUnknownToolHolds() {
+        let oracle = PermissionOracle(allowPatterns: [])
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "rm -rf /"), .hold)
+        XCTAssertEqual(oracle.verdict(toolName: "Edit", primaryArgument: "/tmp/a.txt"), .hold)
+    }
+
+    func testBareToolRuleAllowsEverything() {
+        let oracle = PermissionOracle(allowPatterns: ["Bash"])
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "anything at all"), .defer_)
+    }
+
+    func testPrefixRule() {
+        let oracle = PermissionOracle(allowPatterns: ["Bash(git status:*)"])
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git status --short"), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "git push"), .hold)
+    }
+
+    func testExactRule() {
+        let oracle = PermissionOracle(allowPatterns: ["Bash(npm test)"])
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "npm test"), .defer_)
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "npm test --watch"), .hold)
+    }
+
+    func testMalformedPatternNeverAllows() {
+        let oracle = PermissionOracle(allowPatterns: ["Bash(unclosed", ""])
+        XCTAssertEqual(oracle.verdict(toolName: "Bash", primaryArgument: "ls"), .hold)
+    }
+}
+
+final class ClaudeCodeInterpreterTests: XCTestCase {
+    func testBashToolCall() throws {
+        let payload = Data(#"{"tool_name":"Bash","tool_input":{"command":"npm test"}}"#.utf8)
+        let call = try XCTUnwrap(ClaudeCodeInterpreter.toolCall(fromPayload: payload))
+        XCTAssertEqual(call.name, "Bash")
+        XCTAssertEqual(call.primaryArgument, "npm test")
+        XCTAssertEqual(call.summary, "npm test")
+    }
+
+    func testEditToolCall() throws {
+        let payload = Data(#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/x.swift","old_string":"a"}}"#.utf8)
+        let call = try XCTUnwrap(ClaudeCodeInterpreter.toolCall(fromPayload: payload))
+        XCTAssertEqual(call.primaryArgument, "/tmp/x.swift")
+    }
+
+    func testNonToolPayloadReturnsNil() {
+        XCTAssertNil(ClaudeCodeInterpreter.toolCall(fromPayload: Data(#"{"prompt":"hi"}"#.utf8)))
+        XCTAssertNil(ClaudeCodeInterpreter.toolCall(fromPayload: Data("not json".utf8)))
+    }
+
+    func testStatusLines() {
+        XCTAssertEqual(
+            ClaudeCodeInterpreter.statusLine(event: "UserPromptSubmit", payload: Data(#"{"prompt":"fix\nthe bug"}"#.utf8)),
+            "You: fix the bug"
+        )
+        XCTAssertEqual(
+            ClaudeCodeInterpreter.statusLine(event: "Stop", payload: Data("{}".utf8)),
+            "Done — click to jump"
+        )
+        XCTAssertNil(ClaudeCodeInterpreter.statusLine(event: "PostToolUse", payload: Data("{}".utf8)))
+    }
+}
+
+final class Phase2ParsingTests: XCTestCase {
+    func testEditDetails() throws {
+        let payload = Data(#"{"tool_name":"Edit","tool_input":{"file_path":"/a.ts","old_string":"x","new_string":"y"}}"#.utf8)
+        let call = try XCTUnwrap(ClaudeCodeInterpreter.toolCall(fromPayload: payload))
+        XCTAssertEqual(call.details, .fileEdit(path: "/a.ts", old: "x", new: "y"))
+    }
+
+    func testPlanDetails() throws {
+        let payload = Data("{\"tool_name\":\"ExitPlanMode\",\"tool_input\":{\"plan\":\"## Do it\"}}".utf8)
+        let call = try XCTUnwrap(ClaudeCodeInterpreter.toolCall(fromPayload: payload))
+        XCTAssertEqual(call.details, .plan(markdown: "## Do it"))
+        XCTAssertTrue(PermissionRequest(
+            id: UUID(), sessionID: SessionID(agent: "claude-code", raw: "s"),
+            toolName: call.name, summary: call.summary, details: call.details
+        ).isPlanReview)
+    }
+
+    func testQuestionParsing() throws {
+        let payload = Data("""
+        {"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which target?","options":[{"label":"Prod"},{"label":"Staging"}]}]}}
+        """.utf8)
+        let question = try XCTUnwrap(ClaudeCodeInterpreter.question(fromPayload: payload))
+        XCTAssertEqual(question.question, "Which target?")
+        XCTAssertEqual(question.options, ["Prod", "Staging"])
+        XCTAssertNil(ClaudeCodeInterpreter.question(fromPayload: Data(#"{"tool_name":"Bash"}"#.utf8)))
+    }
+
+    func testTodoParsing() throws {
+        let payload = Data("""
+        {"tool_name":"TodoWrite","tool_input":{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}}
+        """.utf8)
+        let todos = try XCTUnwrap(ClaudeCodeInterpreter.todos(fromPayload: payload))
+        XCTAssertEqual(todos.count, 2)
+        XCTAssertEqual(todos[0].status, .completed)
+        XCTAssertEqual(todos[1].status, .inProgress)
+    }
+}
+
+final class ApprovalRulesStoreTests: XCTestCase {
+    @MainActor
+    func testRulePersistenceAndMatching() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rules-\(UUID().uuidString).json").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let store = ApprovalRulesStore(path: path)
+        XCTAssertFalse(store.allows(toolName: "Bash", primaryArgument: "git push"))
+
+        store.addRule(toolName: "Bash", primaryArgument: "git push origin main")
+        XCTAssertTrue(store.allows(toolName: "Bash", primaryArgument: "git status"), "prefix rule on first token")
+        XCTAssertFalse(store.allows(toolName: "Bash", primaryArgument: "npm test"))
+
+        store.addRule(toolName: "WebFetch", primaryArgument: nil)
+        XCTAssertTrue(store.allows(toolName: "WebFetch", primaryArgument: "https://x.test"))
+
+        // Reload from disk.
+        let reloaded = ApprovalRulesStore(path: path)
+        XCTAssertEqual(reloaded.patterns.sorted(), ["Bash(git:*)", "WebFetch"])
+    }
+}
+
+final class CopilotAdapterTests: XCTestCase {
+    func testInstallBothSurfacesIdempotentAndPreserving() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("copilot-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let hooksDirectory = dir + "/hooks"
+        try FileManager.default.createDirectory(atPath: hooksDirectory, withIntermediateDirectories: true)
+        try Data("legacy".utf8).write(to: URL(fileURLWithPath: hooksDirectory + "/copyisland.json"))
+        // Seed settings with a foreign hook entry that must survive.
+        let seed = #"{"version":1,"hooks":{"agentStop":[{"type":"command","bash":"/other/tool --event agentStop","timeoutSec":10}]}}"#
+        try Data(seed.utf8).write(to: URL(fileURLWithPath: dir + "/settings.json"))
+
+        let installer = CopilotHookInstaller(copilotDirectory: dir, shimPath: "/fake/island-shim")
+        XCTAssertEqual(installer.health(), .missing)
+        try installer.install()
+        XCTAssertEqual(installer.health(), .installed)
+        let once = try String(contentsOfFile: dir + "/settings.json", encoding: .utf8)
+        try installer.install()
+        let twice = try String(contentsOfFile: dir + "/settings.json", encoding: .utf8)
+        XCTAssertEqual(once, twice, "double install must not duplicate")
+        XCTAssertTrue(once.contains("/other/tool"), "foreign entries preserved")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "/hooks/aisland.json"))
+
+        // Hook file has PascalCase events with fail-open guarded commands.
+        let hookData = try XCTUnwrap(FileManager.default.contents(atPath: dir + "/hooks/aisland.json"))
+        let hookJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: hookData) as? [String: Any])
+        let hooks = try XCTUnwrap(hookJSON["hooks"] as? [String: Any])
+        XCTAssertNotNil(hooks["PreToolUse"])
+        XCTAssertNotNil(hooks["Stop"])
+        XCTAssertNotNil(hooks["SessionEnd"])
+        XCTAssertNotNil(hooks["SubagentStart"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: hooksDirectory + "/copyisland.json"))
+
+        try installer.uninstall()
+        XCTAssertEqual(installer.health(), .missing)
+        let final = try String(contentsOfFile: dir + "/settings.json", encoding: .utf8)
+        XCTAssertTrue(final.contains("/other/tool"), "foreign entries survive uninstall")
+        XCTAssertFalse(final.contains("island-shim"))
+    }
+
+    func testInterpreterEventMapping() {
+        let stop = CopilotInterpreter.update(event: "agentStop", payload: Data("{}".utf8))
+        XCTAssertTrue(stop.idle)
+        let prompt = CopilotInterpreter.update(
+            event: "UserPromptSubmit",
+            payload: Data(#"{"prompt":"add dark mode"}"#.utf8)
+        )
+        XCTAssertEqual(prompt.title, "add dark mode")
+        XCTAssertFalse(prompt.idle)
+        let permission = CopilotInterpreter.update(event: "permissionRequest", payload: Data("{}".utf8))
+        XCTAssertEqual(permission.statusLine, "⚠ Needs approval in terminal")
+
+        let realVSCodeTool = CopilotInterpreter.update(
+            event: "PostToolUse",
+            payload: Data(#"{"sessionId":"s1","cwd":"/tmp/project","toolName":"bash","toolArgs":"{}"}"#.utf8)
+        )
+        XCTAssertEqual(realVSCodeTool.statusLine, "Finished bash")
+
+        let nestedPrompt = CopilotInterpreter.update(
+            event: "userPromptSubmitted",
+            payload: Data(#"{"input":{"sessionId":"s1","userPrompt":"fix the login flow"}}"#.utf8)
+        )
+        XCTAssertEqual(nestedPrompt.title, "fix the login flow")
+
+        let subagentStop = CopilotInterpreter.update(event: "SubagentStop", payload: Data("{}".utf8))
+        XCTAssertEqual(subagentStop.statusLine, "Subagent finished")
+        XCTAssertFalse(subagentStop.idle)
+    }
+}
+
+final class UsageParserTests: XCTestCase {
+    func testParsePercentAndCountdown() throws {
+        let resets = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3 * 3600 + 59 * 60 + 30))
+        let json = #"{"five_hour":{"utilization":11,"resets_at":"\#(resets)"},"seven_day":{"utilization":2}}"#
+        let snapshot = try XCTUnwrap(UsageParser.parse(Data(json.utf8)))
+        XCTAssertEqual(snapshot.fiveHour?.utilization, 11)
+        XCTAssertEqual(snapshot.sevenDay?.utilization, 2)
+        let strip = try XCTUnwrap(snapshot.stripText)
+        XCTAssertTrue(strip.hasPrefix("5h 11% · 3h59m"), "got: \(strip)")
+        XCTAssertTrue(strip.contains("7d 2%"))
+    }
+
+    func testParseFractionUtilization() throws {
+        let snapshot = try XCTUnwrap(UsageParser.parse(Data(#"{"five_hour":{"utilization":0.42}}"#.utf8)))
+        XCTAssertEqual(snapshot.fiveHour?.utilization, 42)
+    }
+
+    func testGarbageReturnsNil() {
+        XCTAssertNil(UsageParser.parse(Data("not json".utf8)))
+        XCTAssertNil(UsageParser.parse(Data("{}".utf8)))
+    }
+}
+
+final class CodexAdapterTests: XCTestCase {
+    func testTurnInfoParsing() throws {
+        let payload = Data("""
+        {"type":"agent-turn-complete","thread-id":"t1","input-messages":["optimize queries"],"last-assistant-message":"Done, all tests pass."}
+        """.utf8)
+        let turn = try XCTUnwrap(CodexInterpreter.turnInfo(fromPayload: payload))
+        XCTAssertEqual(turn.title, "optimize queries")
+        XCTAssertEqual(turn.statusLine, "Done, all tests pass.")
+        XCTAssertNil(CodexInterpreter.turnInfo(fromPayload: Data(#"{"type":"other"}"#.utf8)))
+    }
+
+    func testNotifyInstallPreservesConfigAndIsIdempotent() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-\(UUID().uuidString).toml").path
+        defer {
+            try? FileManager.default.removeItem(atPath: path)
+            try? FileManager.default.removeItem(atPath: path + ".aisland.bak")
+        }
+        let seed = """
+        model = "o5"
+        approval_policy = "on-request"
+
+        [profiles.fast]
+        model = "o5-mini"
+        """
+        try Data(seed.utf8).write(to: URL(fileURLWithPath: path))
+
+        let installer = CodexNotifyInstaller(configPath: path, shimPath: "/fake/island-shim")
+        XCTAssertEqual(installer.health(), .missing)
+        try installer.install()
+        let once = try String(contentsOfFile: path, encoding: .utf8)
+        try installer.install()
+        let twice = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertEqual(once, twice, "double install must not duplicate")
+        XCTAssertEqual(installer.health(), .installed)
+        XCTAssertTrue(once.contains("model = \"o5\""), "user config preserved")
+        XCTAssertTrue(once.contains("[profiles.fast]"))
+        // notify must be top-level: before the first section header.
+        let notifyIndex = try XCTUnwrap(once.range(of: "notify = ")).lowerBound
+        let sectionIndex = try XCTUnwrap(once.range(of: "[profiles.fast]")).lowerBound
+        XCTAssertLessThan(notifyIndex, sectionIndex)
+
+        try installer.uninstall()
+        let final = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertFalse(final.contains("island-shim"))
+        XCTAssertTrue(final.contains("model = \"o5\""))
+    }
+
+    func testConflictingNotifyNotOverwrittenSilently() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-\(UUID().uuidString).toml").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data("notify = [\"/usr/bin/other-notifier\"]\n".utf8).write(to: URL(fileURLWithPath: path))
+        let installer = CodexNotifyInstaller(configPath: path, shimPath: "/fake/island-shim")
+        XCTAssertEqual(installer.health(), .conflicting("notify = [\"/usr/bin/other-notifier\"]"))
+        // install() replaces it (backup preserves the original).
+        try installer.install()
+        XCTAssertEqual(installer.health(), .installed)
+    }
+}
+
+final class ClaudeHookInstallerTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("installer-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    private func makeInstaller() -> ClaudeHookInstaller {
+        ClaudeHookInstaller(
+            settingsPath: directory.appendingPathComponent("settings.json").path,
+            shimPath: "/fake/island-shim",
+            manifestPath: directory.appendingPathComponent("installed.json").path
+        )
+    }
+
+    private func settingsJSON(_ installer: ClaudeHookInstaller) throws -> [String: Any] {
+        let data = try XCTUnwrap(FileManager.default.contents(atPath: installer.settingsPath))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testInstallIsIdempotent() throws {
+        let installer = makeInstaller()
+        // Seed with existing user content that must survive.
+        let seed = #"{"permissions":{"allow":["Bash(git status:*)"]},"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"say done"}]}]}}"#
+        try Data(seed.utf8).write(to: URL(fileURLWithPath: installer.settingsPath))
+
+        try installer.install()
+        let once = try settingsJSON(installer)
+        try installer.install()
+        let twice = try settingsJSON(installer)
+
+        XCTAssertEqual(
+            NSDictionary(dictionary: once), NSDictionary(dictionary: twice),
+            "double install must not duplicate entries"
+        )
+        // User's own hook and permissions survive.
+        let hooks = try XCTUnwrap(twice["hooks"] as? [String: Any])
+        let stop = try XCTUnwrap(hooks["Stop"] as? [[String: Any]])
+        XCTAssertTrue(stop.contains { matcher in
+            ((matcher["hooks"] as? [[String: Any]]) ?? []).contains { ($0["command"] as? String) == "say done" }
+        })
+        XCTAssertNotNil(twice["permissions"])
+        // Gate present.
+        let pre = try XCTUnwrap(hooks["PreToolUse"] as? [[String: Any]])
+        XCTAssertTrue(pre.contains { matcher in
+            ((matcher["hooks"] as? [[String: Any]]) ?? []).contains {
+                ($0["command"] as? String)?.contains("island-shim claude-code PreToolUse --gate") == true
+            }
+        })
+        XCTAssertEqual(installer.health(), .stale("/fake/island-shim"))
+    }
+
+    func testUninstallRestoresUserHooksOnly() throws {
+        let installer = makeInstaller()
+        let seed = #"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"say done"}]}]}}"#
+        try Data(seed.utf8).write(to: URL(fileURLWithPath: installer.settingsPath))
+
+        try installer.install()
+        try installer.uninstall()
+        let final = try settingsJSON(installer)
+        let hooks = try XCTUnwrap(final["hooks"] as? [String: Any])
+        XCTAssertEqual(hooks.keys.sorted(), ["Stop"])
+        XCTAssertEqual(installer.health(), .missing)
+    }
+}
