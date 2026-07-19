@@ -231,6 +231,20 @@ final class CopilotAdapterTests: XCTestCase {
         XCTAssertNotNil(hooks["Stop"])
         XCTAssertNotNil(hooks["SessionEnd"])
         XCTAssertNotNil(hooks["SubagentStart"])
+        XCTAssertNotNil(hooks["PermissionRequest"])
+        XCTAssertNotNil(hooks["permissionRequest"])
+        for value in hooks.values {
+            let entries = value as? [[String: Any]] ?? []
+            XCTAssertTrue(entries.allSatisfy { ($0["command"] as? String)?.contains("exit 0") == true })
+        }
+        let settingsData = try XCTUnwrap(FileManager.default.contents(atPath: dir + "/settings.json"))
+        let settingsJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: settingsData) as? [String: Any])
+        let settingsHooks = try XCTUnwrap(settingsJSON["hooks"] as? [String: Any])
+        let cliPermissionEntries = try XCTUnwrap(settingsHooks["permissionRequest"] as? [[String: Any]])
+        XCTAssertTrue(cliPermissionEntries.contains {
+            ($0["bash"] as? String)?.contains("exit 0") == true &&
+            ($0["powershell"] as? String)?.contains("exit 0") == true
+        })
         XCTAssertFalse(FileManager.default.fileExists(atPath: hooksDirectory + "/copyisland.json"))
 
         try installer.uninstall()
@@ -251,6 +265,14 @@ final class CopilotAdapterTests: XCTestCase {
         XCTAssertFalse(prompt.idle)
         let permission = CopilotInterpreter.update(event: "permissionRequest", payload: Data("{}".utf8))
         XCTAssertEqual(permission.statusLine, "⚠ Needs approval in terminal")
+        XCTAssertTrue(permission.needsAttention)
+
+        let nestedPermission = CopilotInterpreter.update(
+            event: "PermissionRequest",
+            payload: Data(#"{"input":{"arguments":{"tool_input":{"toolName":"terminal"}}}}"#.utf8)
+        )
+        XCTAssertEqual(nestedPermission.statusLine, "⚠ Needs approval for terminal")
+        XCTAssertTrue(nestedPermission.needsAttention)
 
         let realVSCodeTool = CopilotInterpreter.update(
             event: "PostToolUse",

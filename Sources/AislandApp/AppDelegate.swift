@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NotchActions {
         router.onNeedsAttention = { [weak self] in
             self?.controllers.first?.setExpanded(true)
         }
+        store.onNeedsAttention = { [weak self] in
+            self?.controllers.first?.setExpanded(true)
+        }
         router.onCtlJump = { [weak self] ref, reply in
             Task { [weak self] in
                 guard let self else { return reply("app gone") }

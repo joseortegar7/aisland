@@ -102,11 +102,16 @@ public final class SessionStore {
 
     public var firstRequest: PermissionRequest? { requests.first }
     public var firstQuestion: QuestionPrompt? { questions.first }
-    public var needsAttention: Bool { !requests.isEmpty || !questions.isEmpty }
+    public var needsAttention: Bool {
+        !requests.isEmpty || !questions.isEmpty || sessions.values.contains { $0.phase == .awaitingPermission }
+    }
 
     /// Sound effect hook, wired by the app layer.
     @ObservationIgnored
     public var onSound: ((SoundEvent) -> Void)?
+
+    @ObservationIgnored
+    public var onNeedsAttention: (() -> Void)?
 
     public init() {}
 
@@ -128,10 +133,19 @@ public final class SessionStore {
             // Copilot notify-only sessions (VS Code agent + CLI hooks).
             if event.agent == "copilot" {
                 let update = CopilotInterpreter.update(event: event.event, payload: event.payload)
-                if let status = update.statusLine { session.statusLine = status }
+                let wasAwaitingPermission = session.phase == .awaitingPermission
+                if let status = update.statusLine {
+                    session.statusLine = status
+                } else if wasAwaitingPermission && !update.needsAttention {
+                    session.statusLine = nil
+                }
                 if session.title == nil, let title = update.title { session.title = title }
-                session.phase = update.idle ? .idle : .working
+                session.phase = update.needsAttention ? .awaitingPermission : (update.idle ? .idle : .working)
                 sessions[id] = session
+                if update.needsAttention && !wasAwaitingPermission {
+                    onSound?(.needsPermission)
+                    onNeedsAttention?()
+                }
                 if update.idle { questions.removeAll { $0.sessionID == id } }
                 return
             }

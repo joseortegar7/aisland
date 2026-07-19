@@ -15,6 +15,7 @@ public struct CopilotHookInstaller: Sendable {
     static let pascalEvents = [
         "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse",
         "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStart", "SubagentStop",
+        "PermissionRequest", "permissionRequest",
     ]
     static let camelEvents = [
         "sessionStart", "sessionEnd", "userPromptSubmit", "userPromptSubmitted",
@@ -80,8 +81,8 @@ public struct CopilotHookInstaller: Sendable {
             }
             entries.append([
                 "type": "command",
-                "bash": "\(shimPath) copilot \(event)",
-                "powershell": "\(shimPath) copilot \(event)",
+                "bash": command(event: event),
+                "powershell": command(event: event),
                 "timeoutSec": 10,
             ])
             hooks[event] = entries
@@ -132,49 +133,69 @@ public enum CopilotInterpreter {
         public let statusLine: String?
         public let title: String?
         public let idle: Bool
+        public let needsAttention: Bool
     }
 
     public static func update(event: String, payload: Data) -> Update {
         let object = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any]
-        let input = object?["input"] as? [String: Any]
-        let value: (String) -> String? = { key in
-            (object?[key] as? String) ?? (input?[key] as? String)
+        let value: ([String]) -> String? = { keys in
+            firstString(for: keys, in: object)
         }
         switch event {
         case "Stop", "agentStop":
-            return Update(statusLine: "Done — click to jump", title: nil, idle: true)
+            return Update(statusLine: "Done — click to jump", title: nil, idle: true, needsAttention: false)
         case "UserPromptSubmit", "userPromptSubmit", "userPromptSubmitted":
-            let prompt = value("prompt") ?? value("message") ?? value("userPrompt")
+            let prompt = value(["prompt", "message", "userPrompt"])
             let flattened = prompt?.replacingOccurrences(of: "\n", with: " ")
             return Update(
                 statusLine: flattened.map { "You: " + String($0.prefix(100)) },
                 title: flattened.map { String($0.prefix(60)) },
-                idle: false
+                idle: false,
+                needsAttention: false
             )
-        case "permissionRequest":
-            return Update(statusLine: "⚠ Needs approval in terminal", title: nil, idle: false)
+        case "PermissionRequest", "permissionRequest":
+            let tool = value(["tool_name", "toolName", "name"])
+            let status = tool.map { "⚠ Needs approval for \($0)" } ?? "⚠ Needs approval in terminal"
+            return Update(statusLine: status, title: nil, idle: false, needsAttention: true)
         case "notification", "errorOccurred":
-            let message = value("message") ?? value("text")
-            return Update(statusLine: message.map { String($0.prefix(120)) }, title: nil, idle: false)
+            let message = value(["message", "text"])
+            return Update(statusLine: message.map { String($0.prefix(120)) }, title: nil, idle: false, needsAttention: false)
         case "SessionStart", "sessionStart":
-            return Update(statusLine: "Session started", title: nil, idle: false)
+            return Update(statusLine: "Session started", title: nil, idle: false, needsAttention: false)
         case "PreToolUse", "preToolUse":
-            let tool = value("tool_name") ?? value("toolName")
-            return Update(statusLine: tool.map { "Running \($0)" }, title: nil, idle: false)
+            let tool = value(["tool_name", "toolName", "name"])
+            return Update(statusLine: tool.map { "Running \($0)" }, title: nil, idle: false, needsAttention: false)
         case "PostToolUse", "postToolUse":
-            let tool = value("tool_name") ?? value("toolName")
-            return Update(statusLine: tool.map { "Finished \($0)" }, title: nil, idle: false)
+            let tool = value(["tool_name", "toolName", "name"])
+            return Update(statusLine: tool.map { "Finished \($0)" }, title: nil, idle: false, needsAttention: false)
         case "PostToolUseFailure", "postToolUseFailure":
-            let tool = value("tool_name") ?? value("toolName")
-            return Update(statusLine: "Failed \(tool ?? "tool")", title: nil, idle: false)
+            let tool = value(["tool_name", "toolName", "name"])
+            return Update(statusLine: "Failed \(tool ?? "tool")", title: nil, idle: false, needsAttention: false)
         case "SubagentStart", "subagentStart":
-            return Update(statusLine: "Subagent started", title: nil, idle: false)
+            return Update(statusLine: "Subagent started", title: nil, idle: false, needsAttention: false)
         case "SubagentStop", "subagentStop":
-            return Update(statusLine: "Subagent finished", title: nil, idle: false)
+            return Update(statusLine: "Subagent finished", title: nil, idle: false, needsAttention: false)
         case "preCompact":
-            return Update(statusLine: "Compacting context", title: nil, idle: false)
+            return Update(statusLine: "Compacting context", title: nil, idle: false, needsAttention: false)
         default:
-            return Update(statusLine: nil, title: nil, idle: false)
+            return Update(statusLine: nil, title: nil, idle: false, needsAttention: false)
         }
+    }
+
+    private static func firstString(for keys: [String], in value: Any?, depth: Int = 0) -> String? {
+        guard depth <= 3 else { return nil }
+        if let object = value as? [String: Any] {
+            for key in keys {
+                if let string = object[key] as? String, !string.isEmpty { return string }
+            }
+            for nested in object.values {
+                if let string = firstString(for: keys, in: nested, depth: depth + 1) { return string }
+            }
+        } else if let array = value as? [Any] {
+            for nested in array {
+                if let string = firstString(for: keys, in: nested, depth: depth + 1) { return string }
+            }
+        }
+        return nil
     }
 }

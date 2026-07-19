@@ -73,4 +73,40 @@ final class SessionStoreTests: XCTestCase {
         store.apply(end)
         XCTAssertTrue(store.sessions.isEmpty)
     }
+
+    @MainActor
+    func testCopilotPermissionRequestsAttentionAndClearsOnActivity() {
+        let store = SessionStore()
+        var sounds: [SoundEvent] = []
+        var attentionCount = 0
+        store.onSound = { sounds.append($0) }
+        store.onNeedsAttention = { attentionCount += 1 }
+        let terminal = TerminalRef(termProgram: "vscode")
+
+        store.apply(HookEvent(
+            agent: "copilot", event: "permissionRequest", sessionID: "waiting",
+            cwd: "/tmp/waiting", terminal: terminal,
+            payload: Data(#"{"arguments":{"toolName":"terminal"}}"#.utf8)
+        ))
+        store.apply(HookEvent(
+            agent: "copilot", event: "sessionStart", sessionID: "other",
+            cwd: "/tmp/other", terminal: terminal, payload: Data()
+        ))
+
+        let waitingID = SessionID(agent: "copilot", raw: "waiting")
+        XCTAssertEqual(store.sessions[waitingID]?.phase, .awaitingPermission)
+        XCTAssertEqual(store.ordered.first?.id, waitingID)
+        XCTAssertTrue(store.needsAttention)
+        XCTAssertEqual(sounds.filter { $0 == .needsPermission }.count, 1)
+        XCTAssertEqual(attentionCount, 1)
+
+        store.apply(HookEvent(
+            agent: "copilot", event: "PostToolUse", sessionID: "waiting",
+            cwd: "/tmp/waiting", terminal: terminal,
+            payload: Data(#"{"tool_input":{"toolName":"terminal"}}"#.utf8)
+        ))
+        XCTAssertEqual(store.sessions[waitingID]?.phase, .working)
+        XCTAssertEqual(store.sessions[waitingID]?.statusLine, "Finished terminal")
+        XCTAssertFalse(store.needsAttention)
+    }
 }
